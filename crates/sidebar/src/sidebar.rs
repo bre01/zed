@@ -3915,6 +3915,12 @@ impl Sidebar {
             self.show_fork_thread_error("source thread metadata not found", cx);
             return;
         };
+        if source.remote_connection.is_some()
+            && (source.agent_id.as_ref() == ZED_AGENT_ID.as_ref() || thread_workspace.is_none())
+        {
+            self.show_fork_thread_error("open the remote agent thread before forking it", cx);
+            return;
+        }
         let Some(panel) = thread_workspace
             .or_else(|| self.active_workspace(cx))
             .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
@@ -5853,9 +5859,10 @@ impl Sidebar {
         let Some(ListEntry::Thread(thread)) = self.contents.entries.get(ix) else {
             return;
         };
-        // Mirror the context menu's gating: forking needs a non-draft,
-        // non-remote thread.
-        if thread.metadata.remote_connection.is_some() {
+        if thread.metadata.remote_connection.is_some()
+            && (thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref()
+                || !matches!(&thread.workspace, ThreadEntryWorkspace::Open(_)))
+        {
             return;
         }
         let Some(session_id) = thread.metadata.session_id.clone() else {
@@ -6539,11 +6546,9 @@ impl Sidebar {
 
         let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
         let can_open_as_markdown = thread.is_live || is_zed_thread;
-        // Forking a remote thread isn't supported: its conversation state
-        // lives on the remote host. External agents are offered the entry
-        // optimistically; ones that don't advertise the fork capability fail
-        // with a toast when invoked.
-        let can_fork = thread.metadata.remote_connection.is_none();
+        // An open remote ACP workspace sends the fork request to the agent on that host.
+        let can_fork = thread.metadata.remote_connection.is_none()
+            || (!is_zed_thread && thread_workspace.is_some());
         let folder_paths = thread.metadata.folder_paths().clone();
 
         right_click_menu(context_menu_id)

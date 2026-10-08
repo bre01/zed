@@ -37,7 +37,7 @@ use gpui_util::post_inc;
 use gpui_util::{ResultExt, measure};
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use refineable::Refineable;
 use scheduler::Instant;
@@ -486,7 +486,34 @@ impl ArenaClearNeeded {
     }
 }
 
-pub(crate) type FocusMap = RwLock<SlotMap<FocusId, FocusRef>>;
+#[derive(Default)]
+pub(crate) struct FocusMap {
+    handles: RwLock<SlotMap<FocusId, FocusRef>>,
+    dropped: Mutex<Vec<FocusId>>,
+}
+
+impl std::ops::Deref for FocusMap {
+    type Target = RwLock<SlotMap<FocusId, FocusRef>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handles
+    }
+}
+
+impl FocusMap {
+    pub(crate) fn remove_dropped(&self) -> Vec<FocusId> {
+        let dropped = mem::take(&mut *self.dropped.lock());
+        if !dropped.is_empty() {
+            let mut handles = self.handles.write();
+            for id in &dropped {
+                let focus = handles.remove(*id).expect("dropped focus handle missing");
+                debug_assert_eq!(focus.ref_count.load(SeqCst), 0);
+            }
+        }
+        dropped
+    }
+}
+
 pub(crate) struct FocusRef {
     pub(crate) ref_count: AtomicUsize,
     pub(crate) tab_index: isize,
@@ -652,12 +679,17 @@ impl Eq for FocusHandle {}
 
 impl Drop for FocusHandle {
     fn drop(&mut self) {
-        self.handles
+        let last_reference = self
+            .handles
             .read()
             .get(self.id)
             .unwrap()
             .ref_count
-            .fetch_sub(1, SeqCst);
+            .fetch_sub(1, SeqCst)
+            == 1;
+        if last_reference {
+            self.handles.dropped.lock().push(self.id);
+        }
     }
 }
 
@@ -7444,6 +7476,46 @@ mod tests {
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
+
+    #[test]
+    fn test_focus_handle_cleanup_preserves_live_references() {
+        let handles = std::sync::Arc::new(super::FocusMap::default());
+        let live = (0..10_000)
+            .map(|_| FocusHandle::new(&handles))
+            .collect::<Vec<_>>();
+        let released = FocusHandle::new(&handles);
+        let id = released.id;
+        let weak = released.downgrade();
+        let retained = released.clone();
+        drop(released);
+        assert!(handles.remove_dropped().is_empty());
+        assert!(weak.upgrade().is_some());
+
+        drop(retained);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(handles.remove_dropped(), vec![id]);
+        assert_eq!(handles.read().len(), live.len());
+        assert!(handles.remove_dropped().is_empty());
+    }
+
+    #[gpui::test]
+    fn test_focus_handle_cleanup_blurs_window(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let handle = window
+            .update(cx, |_, window, cx| {
+                let handle = cx.focus_handle();
+                window.focus(&handle, cx);
+                handle
+            })
+            .unwrap();
+        let weak = handle.downgrade();
+        drop(handle);
+        cx.update(|_| {});
+        window
+            .update(cx, |_, window, _| assert!(window.focus.is_none()))
+            .unwrap();
+        assert!(weak.upgrade().is_none());
+    }
 
     #[gpui::test]
     fn test_fully_visible_bounds_preserve_layout_viewport(cx: &mut TestAppContext) {

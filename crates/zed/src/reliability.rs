@@ -31,6 +31,7 @@ type ProjectRegistry = Rc<RefCell<Vec<WeakEntity<Project>>>>;
 
 pub fn init(client: Arc<Client>, workspace_store: Entity<WorkspaceStore>, cx: &mut App) {
     hang_detection::start(client.clone(), cx);
+    start_ui_performance_logging(cx);
     let projects = ProjectRegistry::default();
     start_memory_usage_logging(workspace_store, projects.clone(), cx);
 
@@ -99,6 +100,64 @@ pub fn init(client: Arc<Client>, workspace_store: Entity<WorkspaceStore>, cx: &m
 const MEMORY_USAGE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MEMORY_USAGE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MEMORY_USAGE_MINIMUM_LOGGED_DELTA: u64 = 64 * 1024 * 1024;
+
+fn start_ui_performance_logging(cx: &App) {
+    if std::env::var_os("ZED_TEST_PROFILE_UI").is_none() {
+        return;
+    }
+
+    let executor = cx.background_executor().clone();
+    cx.spawn(async move |cx| {
+        let mut previous_frames = collections::HashMap::default();
+        let mut previous_inputs = collections::HashMap::default();
+        // Diagnostics must not keep collecting indefinitely when the launcher
+        // is used for a normal editing session.
+        for _ in 0..300 {
+            executor.timer(Duration::from_secs(2)).await;
+            cx.update(|cx| {
+                let windows = cx.windows();
+                previous_frames.retain(|id, _| windows.iter().any(|window| window.window_id() == *id));
+                previous_inputs.retain(|id, _| windows.iter().any(|window| window.window_id() == *id));
+                for handle in windows {
+                    handle.update(cx, |_, window, _| {
+                        let window_id = handle.window_id();
+                        let frames = window.frame_duration_snapshot();
+                        let inputs = window.input_latency_snapshot();
+                        let mut draw_durations = frames.draw_duration_histogram.clone();
+                        let mut input_latencies = inputs.latency_histogram.clone();
+                        if let Some(previous) = previous_frames.insert(window_id, frames) {
+                            draw_durations.subtract(&previous.draw_duration_histogram)?;
+                        }
+                        if let Some(previous) = previous_inputs.insert(window_id, inputs) {
+                            input_latencies.subtract(&previous.latency_histogram)?;
+                        }
+                        if !draw_durations.is_empty() || !input_latencies.is_empty() {
+                            log::info!(
+                                "ui frame profile: {}",
+                                serde_json::json!({
+                                    "window": format!("{window_id:?}"),
+                                    "interval_seconds": 2,
+                                    "draw_count": draw_durations.len(),
+                                    "draw_mean_ms": draw_durations.mean() / 1_000_000.0,
+                                    "draw_p50_ms": draw_durations.value_at_quantile(0.5) as f64 / 1_000_000.0,
+                                    "draw_p95_ms": draw_durations.value_at_quantile(0.95) as f64 / 1_000_000.0,
+                                    "draw_max_ms": draw_durations.max() as f64 / 1_000_000.0,
+                                    "input_frames": input_latencies.len(),
+                                    "input_p95_ms": input_latencies.value_at_quantile(0.95) as f64 / 1_000_000.0,
+                                    "input_max_ms": input_latencies.max() as f64 / 1_000_000.0,
+                                })
+                            );
+                        }
+                        anyhow::Ok(())
+                    })??;
+                }
+                anyhow::Ok(())
+            })?;
+        }
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
+}
 
 /// Periodically logs this process' memory usage, so that gradual memory growth can be
 ///

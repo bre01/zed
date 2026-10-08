@@ -1,0 +1,1599 @@
+diff --git a/.claude/skills/run-codex/scripts/run-codex-test.ts b/.claude/skills/run-codex/scripts/run-codex-test.ts
+index d74b28c..a224ca6 100644
+--- a/.claude/skills/run-codex/scripts/run-codex-test.ts
++++ b/.claude/skills/run-codex/scripts/run-codex-test.ts
+@@ -137,7 +137,7 @@ async function main() {
+         await codexAcpAgent.initialize({ protocolVersion: 1 });
+ 
+         // Check auth
+-        const authRequired = await codexAcpClient.authRequired();
++        const authRequired = (await codexAcpClient.readAuthRequirement()).required;
+         if (authRequired) {
+             console.error("Error: Authentication required. Please login to Codex first.");
+             process.exit(1);
+diff --git a/package-lock.json b/package-lock.json
+index 57a0519..e623aca 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -14,6 +14,7 @@
+         "diff": "^9.0.0",
+         "open": "^11.0.1",
+         "vscode-jsonrpc": "^9.0.1",
++        "ws": "^8.22.0",
+         "zod": "^4.0.0"
+       },
+       "bin": {
+@@ -21,6 +22,7 @@
+       },
+       "devDependencies": {
+         "@types/node": "^26.1.0",
++        "@types/ws": "^8.18.2",
+         "ajv": "^8.20.0",
+         "esbuild": "^0.28.2",
+         "mcp-hello-world": "^1.1.2",
+@@ -1368,6 +1370,16 @@
+         "undici-types": "~8.9.0"
+       }
+     },
++    "node_modules/@types/ws": {
++      "version": "8.18.2",
++      "resolved": "https://registry.npmjs.org/@types/ws/-/ws-8.18.2.tgz",
++      "integrity": "sha512-67MQl+fpWKVTT1NYdnmo3U4sc/xPo/zQBncVnI74qmQa0z/b+1g6iYqNmGCPbxO+zz2aklb08a0oHfegiVd0/w==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/node": "*"
++      }
++    },
+     "node_modules/@typescript/typescript-aix-ppc64": {
+       "version": "7.0.2",
+       "resolved": "https://registry.npmjs.org/@typescript/typescript-aix-ppc64/-/typescript-aix-ppc64-7.0.2.tgz",
+@@ -4115,6 +4127,27 @@
+       "dev": true,
+       "license": "ISC"
+     },
++    "node_modules/ws": {
++      "version": "8.22.0",
++      "resolved": "https://registry.npmjs.org/ws/-/ws-8.22.0.tgz",
++      "integrity": "sha512-Ydggc987+RO0AnWtZ/7Wq9FtNvcrL1b/RO0ud9mWjUPgDrsAAwQSF51sm2hm1XofbU/4jkpGEsLFsZZxU+1DOg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=10.0.0"
++      },
++      "peerDependencies": {
++        "bufferutil": "^4.0.1",
++        "utf-8-validate": ">=5.0.2"
++      },
++      "peerDependenciesMeta": {
++        "bufferutil": {
++          "optional": true
++        },
++        "utf-8-validate": {
++          "optional": true
++        }
++      }
++    },
+     "node_modules/wsl-utils": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/wsl-utils/-/wsl-utils-1.0.0.tgz",
+diff --git a/package.json b/package.json
+index 2e271dc..ad940d4 100644
+--- a/package.json
++++ b/package.json
+@@ -58,6 +58,7 @@
+   "type": "module",
+   "devDependencies": {
+     "@types/node": "^26.1.0",
++    "@types/ws": "^8.18.2",
+     "ajv": "^8.20.0",
+     "esbuild": "^0.28.2",
+     "mcp-hello-world": "^1.1.2",
+@@ -71,6 +72,7 @@
+     "diff": "^9.0.0",
+     "open": "^11.0.1",
+     "vscode-jsonrpc": "^9.0.1",
++    "ws": "^8.22.0",
+     "zod": "^4.0.0"
+   }
+ }
+diff --git a/readme-dev.md b/readme-dev.md
+index 58dd0e8..c1df926 100644
+--- a/readme-dev.md
++++ b/readme-dev.md
+@@ -1,11 +1,22 @@
+ This package uses the bundled `@openai/codex` dependency by default.
+ Set `CODEX_PATH` to run a different Codex binary; versions other than the one specified in `package.json` may not be compatible.
+ 
++This Zed Test build connects through `codex app-server proxy` to the existing shared daemon. It never starts or stops an app-server daemon. Closing a session or losing the editor connection detaches the client without sending `turn/interrupt`, including turns started by Zed and in-flight `turn/start` requests. Explicit `session/cancel` or prompt-request cancellation on a live connection still interrupts the turn. The daemon must already be running, and the Codex binary must support `app-server proxy`.
++
++### History pagination
++
++Zed Test advertises `_meta["zed.dev/historyPagination"]: {"version": 1}` in its client capabilities. With this capability, `session/load` replays only the last 100 native history items and returns `_meta["zed.dev/historyPagination"].nextCursor`. Older clients continue to receive the full replay.
++
++To fetch earlier history, the client sends the ACP extension request `_zed/history/page` with `{sessionId, cursor}`. The response contains `{updates, nextCursor}` in chronological order. These updates are returned separately from live `session/update` notifications so the client can prepend them without moving existing content. Cursors belong to one session load and can be retried; `null` means the beginning of the history was reached.
++
++Paging only affects displayed history, never the model's context. Paginated Codex stores use bounded `thread/items/list` reads. Legacy stores require one full history read, retained in the adapter and delivered to Zed one page at a time. Reading an older page does not resume the thread or create a turn.
++
+ ### Runtime environment
+ 
+ - `CODEX_API_KEY` - API key used when the API-key auth method is selected. Takes precedence over `OPENAI_API_KEY`.
+ - `OPENAI_API_KEY` - fallback API key used when the API-key auth method is selected.
+ - `CODEX_PATH` - run a specific Codex executable instead of the bundled package dependency.
++- `CODEX_APP_SERVER_SOCKET` - optional Unix socket path for the shared daemon; defaults to the Codex control socket.
+ - `CODEX_CONFIG` - JSON object merged into the Codex session config.
+ - `MODEL_PROVIDER` - model provider to pass to Codex for new sessions.
+ - `DEFAULT_AUTH_REQUEST` - ACP auth request JSON used when Codex requires authentication.
+@@ -102,4 +113,3 @@ the adapter does not rely on notices being displayed.
+ Command replies, review results, and terminal/retrying errors retain their existing response or
+ failure channels. Clients advertising session compaction support continue to receive the dedicated
+ compaction lifecycle instead of the legacy completion advisory.
+-
+diff --git a/src/CodexAcpClient.ts b/src/CodexAcpClient.ts
+index d261777..4ea1104 100644
+--- a/src/CodexAcpClient.ts
++++ b/src/CodexAcpClient.ts
+@@ -64,6 +64,7 @@ import {arePathBasenamesEqual, arePathsEqual, isAbsolutePathLike} from "./PathUt
+ import {CodexSubagentSubscriptions} from "./subagents/CodexSubagentSubscriptions";
+ import {forkSession as runForkSession} from "./SessionFork";
+ import type {SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
++import {HistoryPagination} from "./HistoryPagination";
+ import {
+     isMissingRolloutError,
+     isThreadActiveWriterError,
+@@ -638,9 +639,6 @@ export class CodexAcpClient {
+         const sessionConfig = await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []);
+         const response = await this.resumeThread({
+             excludeTurns: true,
+-            config: sessionConfig.config,
+-            cwd: request.cwd,
+-            modelProvider: await this.getResumeModelProvider(),
+             threadId: request.sessionId,
+         });
+         onSubscribed?.();
+@@ -674,16 +672,13 @@ export class CodexAcpClient {
+         });
+     }
+ 
+-    async loadSession(request: acp.LoadSessionRequest, onSubscribed?: () => void): Promise<SessionMetadataWithThread> {
++    async loadSession(request: acp.LoadSessionRequest, onSubscribed?: () => void, paginateHistory = false): Promise<SessionMetadataWithThread> {
+         const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
+         await this.refreshSkills(request.cwd, additionalDirectories);
+ 
+         const sessionConfig = await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []);
+         const response = await this.resumeThread({
+             excludeTurns: true,
+-            config: sessionConfig.config,
+-            cwd: request.cwd,
+-            modelProvider: await this.getResumeModelProvider(),
+             threadId: request.sessionId,
+         });
+         onSubscribed?.();
+@@ -691,15 +686,26 @@ export class CodexAcpClient {
+         // A null paginated cursor means there was no durable history at resume time.
+         let thread: Thread = {...response.thread, turns: []};
+         let history: AsyncIterable<ThreadItem[]> = noItems();
++        let pages: HistoryPagination | undefined;
+         if (response.materialized && response.thread.historyMode === "paginated") {
+-            if (response.itemsBackwardsCursor !== null) {
++            if (paginateHistory) {
++                pages = HistoryPagination.paginated(this.codexClient, response.thread.id, response.itemsBackwardsCursor);
++            } else if (response.itemsBackwardsCursor !== null) {
+                 history = this.codexClient.threadItemPages(response.thread.id, {lastItemCursor: response.itemsBackwardsCursor});
+             }
+         } else if (response.materialized) {
+             // A legacy store reads the whole history in one request.
+             const legacy = (await this.codexClient.threadReadWithHistory(response.thread.id)).thread;
+             thread = {...legacy, turns: []};
+-            history = oneItemPage(legacy.turns.flatMap(turn => turn.items));
++            const items = legacy.turns.flatMap(turn => turn.items);
++            if (paginateHistory) pages = HistoryPagination.legacy(items);
++            else history = oneItemPage(items);
++        }
++        let historyPagination: SessionMetadataWithThread["historyPagination"];
++        if (pages) {
++            const page = await pages.read();
++            history = oneItemPage(page.items);
++            historyPagination = {pages, nextCursor: page.nextCursor};
+         }
+         const codexModels = await this.fetchAvailableModels();
+         const currentModelId = this.createModelId(codexModels, response.model, response.reasoningEffort).toString();
+@@ -713,6 +719,7 @@ export class CodexAcpClient {
+             currentServiceTier: response.serviceTier as ServiceTier ?? null,
+             thread,
+             history,
++            historyPagination,
+             additionalDirectories,
+             skippedMcpServers: sessionConfig.skippedMcpServers,
+         };
+diff --git a/src/CodexAcpServer.ts b/src/CodexAcpServer.ts
+index 63ae801..e94a17f 100644
+--- a/src/CodexAcpServer.ts
++++ b/src/CodexAcpServer.ts
+@@ -142,6 +142,7 @@ import {
+ import {randomUUID} from "node:crypto";
+ import {TitleGenerator} from "./TitleGenerator";
+ import {once} from "node:events";
++import {HISTORY_PAGE_METHOD, HISTORY_PAGINATION_META_KEY, supportsHistoryPagination} from "./HistoryPagination";
+ import {
+     AIR_AGENT_FILE_CHANGE_REPORT_KEY,
+     AIR_ASYNC_TASKS_KEY,
+@@ -176,6 +177,7 @@ import {
+ 
+ 
+ export interface SessionState {
++    historyPagination?: SessionMetadataWithThread["historyPagination"];
+     sessionId: string,
+     currentModelId: string,
+     availableModels: Array<Model>,
+@@ -292,6 +294,7 @@ interface ActivePrompt {
+     closeSignal: Promise<null>;
+     cancelSignal: Promise<null>;
+     signal: AbortSignal;
++    detached: boolean;
+     currentTurn: { threadId: string, turnId: string } | null;
+     requestCancel: () => void;
+     requestClose: () => void;
+@@ -336,6 +339,14 @@ export class CodexAcpServer {
+     private authStatusVersion = 0;
+ 
+     private readonly sessions: Map<string, SessionState>;
++    private readonly sharedObservers = new Map<string, {
++        handler: CodexEventHandler;
++        ready: boolean;
++        events: ServerNotification[];
++        queue: Promise<void>;
++        seenUserItems: Set<string>;
++        dispatch: (event: ServerNotification) => void;
++    }>();
+     private readonly mcpSessionStartup: McpSessionStartup;
+     private readonly pendingTurnStarts: Map<string, PendingTurnStart>;
+     private readonly activePrompts: Map<string, ActivePrompt>;
+@@ -357,6 +368,7 @@ export class CodexAcpServer {
+         getExitCode?: () => number | null,
+         getRecentStderr?: () => string,
+         codexProcessState?: CodexProcessState,
++        private readonly transportSignal?: AbortSignal,
+     ) {
+         this.sessions = new Map();
+         this.pendingTurnStarts = new Map();
+@@ -458,6 +470,8 @@ export class CodexAcpServer {
+                     sse: false
+                 },
+                 _meta: {
++                    ...(supportsHistoryPagination(this.clientCapabilities)
++                        ? {[HISTORY_PAGINATION_META_KEY]: {version: 1}} : {}),
+                     // Presence means "this agent pushes `_auth/status_update`". It
+                     // never carries a payload, and the client never asks for one.
+                     [AUTH_STATUS_META_KEY]: authStatusCapability(),
+@@ -492,6 +506,7 @@ export class CodexAcpServer {
+     }
+ 
+     async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
++        if (method === HISTORY_PAGE_METHOD) return await this.loadHistoryPage(params);
+         const methodRequest = { method: method, params: params };
+         if (!isExtMethodRequest(methodRequest)) {
+             return {};
+@@ -826,7 +841,7 @@ export class CodexAcpServer {
+             sessionState.cwd,
+             () => sessionState.sessionTitleSource,
+         );
+-        this.installSessionState(sessionState);
++        this.installSessionState(sessionState, operation !== "fork");
+         resumeSubscribed = false;
+ 
+         const canPublishSessionUpdates = operation !== "fork";
+@@ -1003,9 +1018,66 @@ export class CodexAcpServer {
+         );
+     }
+ 
+-    private installSessionState(sessionState: SessionState): void {
++    private installSessionState(sessionState: SessionState, observe = true, ready = true): void {
+         this.sessions.get(sessionState.sessionId)?.asyncTasks.clear();
+         this.sessions.set(sessionState.sessionId, sessionState);
++        if (observe) this.observeSharedSession(sessionState, ready);
++    }
++
++    private observeSharedSession(sessionState: SessionState, ready = true): void {
++        const previous = this.sharedObservers.get(sessionState.sessionId);
++        void previous?.handler.dispose();
++        const observer = {
++            handler: new CodexEventHandler(
++                this.connection, sessionState, clientSupportsTypedSessionFailures(this.clientCapabilities),
++                this.sessionFailureEpoch, sessionState.subagents,
++                accountUpdated => this.handleAccountUpdated(accountUpdated), false,
++                clientSupportsCompaction(this.clientCapabilities), clientSupportsNotices(this.clientCapabilities),
++            ),
++            ready, events: [] as ServerNotification[], queue: Promise.resolve(),
++            seenUserItems: previous?.seenUserItems ?? new Set<string>(),
++            dispatch: (_event: ServerNotification): void => {},
++        };
++        this.sharedObservers.set(sessionState.sessionId, observer);
++        observer.dispatch = event => {
++            if (!observer.ready) {
++                observer.events.push(event);
++                return;
++            }
++            return observer.queue = observer.queue.then(async () => {
++                if (this.sessions.get(sessionState.sessionId) !== sessionState) return;
++                if (event.method === "item/started" && event.params.item.type === "userMessage"
++                    && !observer.seenUserItems.has(event.params.item.id)) {
++                    observer.seenUserItems.add(event.params.item.id);
++                    const session = new ACPSessionConnection(this.connection, sessionState.sessionId);
++                    for (const update of this.createUserMessageUpdates(event.params.item)) await session.update(update);
++                }
++                await observer.handler.handleNotification(event);
++            }).catch(error => logger.error("Failed to forward a shared session event", error));
++        };
++        const appServer = this.codexAcpClient.appServerClient;
++        void this.codexAcpClient.subscribeToSessionEvents(sessionState.sessionId, observer.dispatch, {
++            handleCommandExecution: params => appServer.waitForOtherClient(params, {decision: "cancel" as const}),
++            handleFileChange: params => appServer.waitForOtherClient(params, {decision: "cancel" as const}),
++            handlePermissionsRequest: params => appServer.waitForOtherClient(params,
++                {permissions: {}, scope: "turn" as const, strictAutoReview: false}),
++        }, {
++            handleElicitation: params => appServer.waitForOtherClient(params,
++                {action: "cancel" as const, content: null, _meta: null}),
++            handleUserInput: params => appServer.waitForOtherClient(params, {answers: {}}),
++        }, clientSupportsSubagents(this.clientCapabilities), async () => {},
++        childThreadId => observer.handler.waitForNativeSubagentSession(childThreadId));
++    }
++
++    private async finishSharedHistoryReplay(sessionId: string): Promise<void> {
++        const observer = this.sharedObservers.get(sessionId);
++        if (!observer) return;
++        observer.ready = true;
++        for (const event of observer.events.splice(0)) {
++            // Re-dispatch through the installed observer's serialized queue.
++            observer.dispatch(event);
++        }
++        await observer.queue;
+     }
+ 
+     private getAuthProviderForAuthenticateRequest(request: acp.AuthenticateRequest): string | null {
+@@ -1034,6 +1106,7 @@ export class CodexAcpServer {
+ 
+         try {
+             await this.streamThreadHistory(sessionId, thread, history);
++            await this.finishSharedHistoryReplay(sessionId);
+         } catch (err) {
+             // A close during the load already closed the session.
+             if (err instanceof SessionClosedDuringLoadError) {
+@@ -1056,13 +1129,40 @@ export class CodexAcpServer {
+             modelId: modelState.currentModelId,
+             availableModelCount: modelState.availableModels.length
+         });
++        const historyPagination = this.getSessionState(sessionId).historyPagination;
+         return {
+             models: modelState,
+             modes: modeState,
+             ...this.createSessionConfigOptionsResponse(this.getSessionState(sessionId)),
++            ...(historyPagination ? {
++                _meta: {[HISTORY_PAGINATION_META_KEY]: {
++                    nextCursor: historyPagination.nextCursor,
++                }},
++            } : {}),
+         };
+     }
+ 
++    private async loadHistoryPage(params: Record<string, unknown>): Promise<Record<string, unknown>> {
++        const sessionId = params["sessionId"];
++        const cursor = params["cursor"];
++        if (!supportsHistoryPagination(this.clientCapabilities)
++            || typeof sessionId !== "string" || typeof cursor !== "string") {
++            throw RequestError.invalidParams("Expected a sessionId and history cursor from a paginated load");
++        }
++        const state = this.getSessionState(sessionId);
++        const historyPagination = state.historyPagination;
++        if (!historyPagination) throw RequestError.invalidRequest("Session history is not paginated");
++        const page = await this.runWithProcessCheck(() => historyPagination.pages.read(cursor));
++        if (this.sessions.get(state.sessionId) !== state) {
++            throw RequestError.invalidRequest("Session was closed or reloaded while reading history");
++        }
++        const updates: UpdateSessionEvent[] = [];
++        for (const item of page.items) updates.push(...await this.createHistoryUpdates(item, state));
++        // Older history is returned separately, never appended to the live stream.
++        // Retries of the same cursor return the same page; Zed advances after applying it.
++        return {updates, nextCursor: page.nextCursor};
++    }
++
+     async resumeSession(params: acp.ResumeSessionRequest): Promise<LegacyResumeSessionResponse> {
+         if (this.providerUpdate !== null) {
+             await this.providerUpdate;
+@@ -1129,7 +1229,6 @@ export class CodexAcpServer {
+ 
+         try {
+             if (sessionState) {
+-                await this.interruptSessionTurn(sessionState, "Close", true);
+                 sessionState.asyncTasks.clear();
+             } else {
+                 logger.log("Close request received for unknown local session", {sessionId: params.sessionId});
+@@ -1142,6 +1241,8 @@ export class CodexAcpServer {
+             }
+ 
+             await this.runWithProcessCheck(() => this.codexAcpClient.closeSession(params.sessionId));
++            await this.sharedObservers.get(params.sessionId)?.handler.dispose();
++            this.sharedObservers.delete(params.sessionId);
+             logger.log("Session closed", {sessionId: params.sessionId});
+         } finally {
+             if (this.getSessionGeneration(params.sessionId) === closeGeneration) {
+@@ -2177,7 +2278,7 @@ export class CodexAcpServer {
+                 sessionMetadata = await this.runWithProcessCheck(() =>
+                     this.codexAcpClient.loadSession(request, () => {
+                         subscribed = true;
+-                    })
++                    }, supportsHistoryPagination(this.clientCapabilities))
+                 );
+             } catch (err) {
+                 // An auth error that is known within the grace time comes first, as it did when the check ran
+@@ -2235,6 +2336,7 @@ export class CodexAcpServer {
+             sessionMcpServers: sessionMcpServers,
+             clientCapabilities: this.capabilities,
+             goalRevision: 0,
++            historyPagination: sessionMetadata.historyPagination,
+             sessionTitle: null,
+             sessionTitleSource: "unset",
+             subagents: new CodexSubagentEventRouter(
+@@ -2253,7 +2355,7 @@ export class CodexAcpServer {
+             sessionState.cwd,
+             () => sessionState.sessionTitleSource,
+         );
+-        this.installSessionState(sessionState);
++        this.installSessionState(sessionState, true, false);
+         if (knownAccount === "pending") {
+             this.applyLateAccountRead(sessionState, authorization, authStatusVersionAtStart);
+         }
+@@ -2310,6 +2412,7 @@ export class CodexAcpServer {
+         for await (const items of itemPages) {
+             for (const item of items) {
+                 if (!isOpen()) throw new SessionClosedDuringLoadError();
++                if (item.type === "userMessage") this.sharedObservers.get(sessionId)?.seenUserItems.add(item.id);
+                 for (const update of await this.createHistoryUpdates(item, sessionState)) {
+                     await session.update(update);
+                 }
+@@ -2330,6 +2433,7 @@ export class CodexAcpServer {
+         for await (const items of itemPages) {
+             for (const item of items) {
+                 if (!isOpen()) throw new SessionClosedDuringLoadError();
++                if (item.type === "userMessage") this.sharedObservers.get(sessionState.sessionId)?.seenUserItems.add(item.id);
+                 if (item.type === "subAgentActivity") {
+                     const activityKind = item.kind as string;
+                     if (activityKind === "started") {
+@@ -2452,8 +2556,9 @@ export class CodexAcpServer {
+             return;
+         }
+ 
+-        const historyTitle = this.findFirstUserMessageTitle(firstItems)
+-            ?? normalizeSessionTitle(thread.preview);
++        const historyTitle = sessionState.historyPagination
++            ? normalizeSessionTitle(thread.preview)
++            : this.findFirstUserMessageTitle(firstItems) ?? normalizeSessionTitle(thread.preview);
+         await this.publishFallbackSessionTitle(sessionState, historyTitle);
+     }
+ 
+@@ -2743,6 +2848,7 @@ export class CodexAcpServer {
+             closeSignal,
+             cancelSignal,
+             signal: abortController.signal,
++            detached: false,
+             currentTurn: null,
+             requestCancel: () => {
+                 if (abortController.signal.aborted) {
+@@ -2756,6 +2862,7 @@ export class CodexAcpServer {
+                     return;
+                 }
+                 closeRequested = true;
++                activePrompt.detached = true;
+                 activePrompt.requestCancel();
+                 resolveCloseSignal(null);
+             },
+@@ -2797,6 +2904,11 @@ export class CodexAcpServer {
+             if (this.activePrompts.get(sessionState.sessionId) !== activePrompt) {
+                 return;
+             }
++            // A lost editor connection ends its RPC, not the daemon's turn.
++            if (this.transportSignal?.aborted || this.sessionIsClosing(sessionState.sessionId)) {
++                activePrompt.requestClose();
++                return;
++            }
+             logger.log("Prompt request cancelled", {sessionId: sessionState.sessionId});
+             activePrompt.requestCancel();
+             const turn = activePrompt.currentTurn;
+@@ -2882,8 +2994,11 @@ export class CodexAcpServer {
+         }
+     }
+ 
+-    private interruptLateStartedTurn(turn: { threadId: string, turnId: string }): void {
+-        void this.interruptPromptTurn(turn, "Close");
++    private interruptLateStartedTurn(turn: { threadId: string, turnId: string }, activePrompt: ActivePrompt): void {
++        // turn/start may already have reached the shared daemon when Zed closes.
++        if (!activePrompt.detached) {
++            void this.interruptPromptTurn(turn, "Close");
++        }
+     }
+ 
+     private promptShouldStop(sessionId: string, activePrompt: ActivePrompt): boolean {
+@@ -3071,7 +3186,7 @@ export class CodexAcpServer {
+                     const turn = {threadId, turnId};
+                     activePrompt.currentTurn = turn;
+                     if (this.promptShouldStop(params.sessionId, activePrompt)) {
+-                        this.interruptLateStartedTurn(turn);
++                        this.interruptLateStartedTurn(turn, activePrompt);
+                         return;
+                     }
+                     sessionState.currentTurnId = turnId;
+@@ -3185,7 +3300,7 @@ export class CodexAcpServer {
+                         const turn = {threadId: params.sessionId, turnId};
+                         activePrompt.currentTurn = turn;
+                         if (this.promptShouldStop(params.sessionId, activePrompt)) {
+-                            this.interruptLateStartedTurn(turn);
++                            this.interruptLateStartedTurn(turn, activePrompt);
+                             return;
+                         }
+                         sessionState.currentTurnId = turnId;
+@@ -3285,7 +3400,7 @@ export class CodexAcpServer {
+                                 const turn = {threadId: params.sessionId, turnId};
+                                 activePrompt.currentTurn = turn;
+                                 if (this.promptShouldStop(params.sessionId, activePrompt)) {
+-                                    this.interruptLateStartedTurn(turn);
++                                    this.interruptLateStartedTurn(turn, activePrompt);
+                                     return;
+                                 }
+                                 sessionState.currentTurnId = turnId;
+@@ -3454,6 +3569,9 @@ export class CodexAcpServer {
+                 registeredPendingTurnStart.resolve(null);
+             }
+             activePrompt.complete();
++            if (!this.sessionIsClosing(params.sessionId) && this.sessions.get(params.sessionId) === sessionState) {
++                this.observeSharedSession(sessionState);
++            }
+         }
+     }
+ 
+diff --git a/src/CodexAppServerClient.ts b/src/CodexAppServerClient.ts
+index c0aebb5..725f73d 100644
+--- a/src/CodexAppServerClient.ts
++++ b/src/CodexAppServerClient.ts
+@@ -1,6 +1,7 @@
+ import {type MessageConnection, RequestType} from "vscode-jsonrpc/node";
+ import {McpOauthCompletions} from "./mcp/McpOauthCompletions";
+ import {McpStartupTracker} from "./mcp/McpStartupTracker";
++import {serverRequestId} from "./ServerRequestIdentity";
+ import type {
+     ClientRequest,
+     InitializeParams,
+@@ -170,6 +171,7 @@ export class CodexAppServerClient {
+     private readonly threadGoalClearedCaptures = new Map<string, Set<() => void>>();
+     private readonly threadSettings = new Map<string, ThreadSettings>();
+     private readonly staleTurnIds = new Map<string, Set<string>>();
++    private readonly passiveRequests = new Map<string | number, () => void>();
+ 
+     constructor(connection: MessageConnection) {
+         this.connection = connection;
+@@ -178,6 +180,10 @@ export class CodexAppServerClient {
+         this.connection.onDispose?.(() => this.disposeMcpWaits());
+         this.connection.onUnhandledNotification((data) => {
+             const serverNotification = data as ServerNotification;
++            if (serverNotification.method === "serverRequest/resolved") {
++                this.passiveRequests.get(serverNotification.params.requestId)?.();
++                this.passiveRequests.delete(serverNotification.params.requestId);
++            }
+             if (isMcpServerStatusUpdatedNotification(serverNotification)) {
+                 this.mcpStartup.record(serverNotification.params);
+             }
+@@ -222,7 +228,7 @@ export class CodexAppServerClient {
+             }
+             const handler = this.approvalHandlers.get(params.threadId);
+             if (!handler) {
+-                return { decision: "cancel" };
++                return this.waitForOtherClient(params, {decision: "cancel" as const});
+             }
+             return await handler.handleCommandExecution(params);
+         });
+@@ -233,7 +239,7 @@ export class CodexAppServerClient {
+             }
+             const handler = this.approvalHandlers.get(params.threadId);
+             if (!handler) {
+-                return { decision: "cancel" };
++                return this.waitForOtherClient(params, {decision: "cancel" as const});
+             }
+             return await handler.handleFileChange(params);
+         });
+@@ -244,7 +250,7 @@ export class CodexAppServerClient {
+             }
+             const handler = this.approvalHandlers.get(params.threadId);
+             if (!handler) {
+-                return { permissions: {}, scope: "turn", strictAutoReview: false };
++                return this.waitForOtherClient(params, {permissions: {}, scope: "turn" as const, strictAutoReview: false});
+             }
+             return await handler.handlePermissionsRequest(params);
+         });
+@@ -255,7 +261,7 @@ export class CodexAppServerClient {
+             }
+             const handler = this.elicitationHandlers.get(params.threadId);
+             if (!handler) {
+-                return { action: "cancel", content: null, _meta: null };
++                return this.waitForOtherClient(params, {action: "cancel" as const, content: null, _meta: null});
+             }
+             return await handler.handleElicitation(params);
+         });
+@@ -266,10 +272,24 @@ export class CodexAppServerClient {
+             }
+             const handler = this.elicitationHandlers.get(params.threadId);
+             if (!handler) {
+-                return { answers: {} };
++                return this.waitForOtherClient(params, {answers: {}});
+             }
+             return await handler.handleUserInput(params);
+         });
++        // Desktop-owned dynamic tools may be replayed to this subscriber too.
++        // An automatic method-not-found error would abort the owner's tool.
++        this.connection.onRequest((_method, params) => this.waitForOtherClient(params ?? {}, null));
++        this.connection.onDispose?.(() => this.passiveRequests.clear());
++    }
++
++    waitForOtherClient<T>(params: object, resolvedResponse: T): Promise<T> {
++        // Returning a denial would win the shared server's first-response race.
++        // Reply only after another client has resolved the request, when the
++        // server no longer accepts this response as an approval decision.
++        const id = serverRequestId(params);
++        return new Promise(resolve => {
++            if (id !== undefined) this.passiveRequests.set(id, () => resolve(resolvedResponse));
++        });
+     }
+ 
+     onApprovalRequest(threadId: string, handler: ApprovalHandler): void {
+@@ -631,6 +651,10 @@ export class CodexAppServerClient {
+         return await this.sendRequest({method: "thread/items/list", params});
+     }
+ 
++    async threadItemsHistoryPage(params: ThreadItemsListParams): Promise<ThreadItemsListResponse> {
++        return await withHistoryTimeout(this.threadItemsList(params), "thread/items/list", params.threadId);
++    }
++
+     /** The turns of a thread in pages, from the first page. See {@link historyPages}. */
+     threadTurnPages({threadId, ...params}: Omit<ThreadTurnsListParams, "cursor">): AsyncGenerator<Turn[]> {
+         return historyPages(threadId, "thread/turns/list", cursor => this.threadTurnsList({threadId, cursor, ...params}));
+diff --git a/src/CodexJsonRpcConnection.ts b/src/CodexJsonRpcConnection.ts
+index 0f79117..4b578de 100644
+--- a/src/CodexJsonRpcConnection.ts
++++ b/src/CodexJsonRpcConnection.ts
+@@ -3,9 +3,12 @@ import type {MessageConnection} from "vscode-jsonrpc/node";
+ import type {ChildProcessWithoutNullStreams} from "node:child_process";
+ import {spawn} from "node:child_process";
+ import {createRequire} from "node:module";
++import {Duplex, PassThrough, Readable, Writable} from "node:stream";
++import WebSocket from "ws";
+ 
+ import {createJSONRPCReader, createJSONRPCWriter} from "./StdUtils";
+ import {logger} from "./Logger";
++import {rememberServerRequest} from "./ServerRequestIdentity";
+ 
+ export interface CodexConnection {
+     readonly connection: MessageConnection
+@@ -14,27 +17,61 @@ export interface CodexConnection {
+ 
+ export function startCodexConnection(codexPath?: string, env?: NodeJS.ProcessEnv): CodexConnection {
+     const spawnEnv = env ?? process.env;
++    const args = ['app-server', 'proxy'];
++    const socketPath = spawnEnv['CODEX_APP_SERVER_SOCKET'];
++    if (socketPath) args.push('--sock', socketPath);
+ 
+     let codex: ChildProcessWithoutNullStreams;
+     if (codexPath) {
+         codex = process.platform === 'win32'
+-            ? spawn(`"${codexPath}" app-server`, { shell: true, env: spawnEnv })
+-            : spawn(codexPath, ['app-server'], { env: spawnEnv });
++            ? spawn(`"${codexPath}"`, args, { shell: true, env: spawnEnv })
++            : spawn(codexPath, args, { env: spawnEnv });
+     } else {
+         const bundledCodexPath = createRequire(import.meta.url).resolve("@openai/codex/bin/codex.js");
+-        codex = spawn(process.execPath, [bundledCodexPath, 'app-server'], {env: spawnEnv});
++        codex = spawn(process.execPath, [bundledCodexPath, ...args], {env: spawnEnv});
+     }
+ 
+     attachLogs(codex);
+ 
+-    const reader = createJSONRPCReader(codex.stdout);
+-    const writer = createJSONRPCWriter(codex.stdin);
++    // The control socket speaks WebSocket. The native proxy relays its bytes;
++    // perform the upgrade and framing here before passing JSON to vscode-jsonrpc.
++    const websocket = new WebSocket("ws://localhost/", {
++        createConnection: () => Duplex.fromWeb({readable: Readable.toWeb(codex.stdout), writable: Writable.toWeb(codex.stdin)}),
++        perMessageDeflate: false,
++        handshakeTimeout: 10_000,
++    });
++    const ready = new Promise<void>((resolve, reject) => {
++        websocket.once("open", resolve);
++        websocket.once("error", reject);
++    });
++    // An early connection failure is still reported by the transport even if no
++    // request has been written yet.
++    void ready.catch(error => logger.error("Shared app-server connection failed", error));
++    const messages = new PassThrough();
++    websocket.on("message", data => messages.write(data.toString() + "\n"));
++    const output = new Writable({
++        write(chunk, _encoding, callback) {
++            void ready.then(() => websocket.send(chunk.toString(), callback)).catch(callback);
++        },
++        final(callback) {websocket.close(); callback();},
++    });
++    const reader = createJSONRPCReader(messages);
++    const listen = reader.listen.bind(reader);
++    reader.listen = callback => listen(message => {
++        rememberServerRequest(message);
++        callback(message);
++    });
++    const writer = createJSONRPCWriter(output);
+ 
+     let connection = rpc.createMessageConnection(reader, writer);
+ 
+     connection.listen();
++    websocket.on("error", () => connection.dispose());
++    output.on("error", () => connection.dispose());
++    websocket.on("close", () => {messages.end(); connection.dispose();});
++    connection.onDispose(() => websocket.terminate());
+ 
+-    // Terminate all current activities on process termination
++    // Only the proxy belongs to this client; the shared daemon keeps running when Zed disconnects.
+     codex.on("exit", _ => {
+         connection.dispose();
+     });
+diff --git a/src/HistoryPagination.ts b/src/HistoryPagination.ts
+new file mode 100644
+index 0000000..650bac2
+--- /dev/null
++++ b/src/HistoryPagination.ts
+@@ -0,0 +1,62 @@
++import type {ClientCapabilities} from "@agentclientprotocol/sdk";
++import {randomUUID} from "node:crypto";
++import type {ThreadItem} from "./app-server/v2";
++import type {CodexAppServerClient} from "./CodexAppServerClient";
++
++export const HISTORY_PAGINATION_META_KEY = "zed.dev/historyPagination";
++export const HISTORY_PAGE_METHOD = "_zed/history/page";
++export const HISTORY_PAGE_SIZE = 100;
++
++export function supportsHistoryPagination(capabilities: ClientCapabilities | null): boolean {
++    const value = capabilities?._meta?.[HISTORY_PAGINATION_META_KEY];
++    return typeof value === "object" && value !== null && "version" in value && value.version === 1;
++}
++
++export interface HistoryPage {
++    /** Complete native items, ordered from oldest to newest within this page. */
++    items: ThreadItem[];
++    nextCursor: string | null;
++}
++
++/** A read-only snapshot boundary; reading an older page never resumes the thread. */
++export class HistoryPagination {
++    private readonly prefix = `${randomUUID()}:`;
++
++    private constructor(private readonly readPage: (cursor: string | null) => Promise<HistoryPage>) {}
++
++    static paginated(client: CodexAppServerClient, threadId: string, boundary: string | null): HistoryPagination {
++        return new HistoryPagination(async cursor => {
++            // A null resume boundary represents an empty snapshot, even if a live
++            // item has been persisted since resume returned.
++            if (boundary === null) return {items: [], nextCursor: null};
++            const page = await client.threadItemsHistoryPage({
++                threadId, cursor: cursor ?? boundary, limit: HISTORY_PAGE_SIZE, sortDirection: "desc",
++            });
++            if (page.nextCursor !== null && page.nextCursor === (cursor ?? boundary)) {
++                throw new Error("Codex history pagination returned a repeated cursor");
++            }
++            return {items: page.data.map(entry => entry.item).reverse(), nextCursor: page.nextCursor};
++        });
++    }
++
++    static legacy(items: ThreadItem[]): HistoryPagination {
++        // Legacy stores expose only a full-history read. Keep that snapshot in
++        // the adapter, but construct at most one page of Zed entities at a time.
++        return new HistoryPagination(async cursor => {
++            const end = cursor === null ? items.length : Number(cursor);
++            if (!Number.isSafeInteger(end) || end < 0 || end > items.length) {
++                throw new Error("Invalid legacy history cursor");
++            }
++            const start = Math.max(0, end - HISTORY_PAGE_SIZE);
++            return {items: items.slice(start, end), nextCursor: start > 0 ? String(start) : null};
++        });
++    }
++
++    async read(cursor: string | null = null): Promise<HistoryPage> {
++        if (cursor !== null && !cursor.startsWith(this.prefix)) {
++            throw new Error("History cursor belongs to a different session load");
++        }
++        const page = await this.readPage(cursor === null ? null : cursor.slice(this.prefix.length));
++        return {...page, nextCursor: page.nextCursor === null ? null : this.prefix + page.nextCursor};
++    }
++}
+diff --git a/src/ServerRequestIdentity.ts b/src/ServerRequestIdentity.ts
+new file mode 100644
+index 0000000..d667087
+--- /dev/null
++++ b/src/ServerRequestIdentity.ts
+@@ -0,0 +1,23 @@
++import type {Message, RequestMessage} from "vscode-jsonrpc/node";
++
++// vscode-jsonrpc passes params to handlers, but omits the request id. Keep the
++// identity so a passive subscriber can wait for serverRequest/resolved.
++const requestIds = new WeakMap<object, string | number>();
++
++export function rememberServerRequest(message: Message | RequestMessage): void {
++    if ("method" in message && "id" in message && "params" in message
++        && (typeof message.id === "string" || typeof message.id === "number")
++        && message.params !== null && typeof message.params === "object") {
++        requestIds.set(message.params, message.id);
++    }
++}
++
++export function serverRequestId(params: object): string | number | undefined {
++    return requestIds.get(params);
++}
++
++export function copyServerRequestIdentity<T extends object>(source: object, target: T): T {
++    const id = requestIds.get(source);
++    if (id !== undefined) requestIds.set(target, id);
++    return target;
++}
+diff --git a/src/SessionMetadata.ts b/src/SessionMetadata.ts
+index 8e74a7e..05ffa43 100644
+--- a/src/SessionMetadata.ts
++++ b/src/SessionMetadata.ts
+@@ -1,6 +1,7 @@
+ import type {ModeKind} from "./app-server/ModeKind";
+ import type {ServiceTier} from "./app-server/ServiceTier";
+ import type {Model, Thread, ThreadItem} from "./app-server/v2";
++import type {HistoryPagination} from "./HistoryPagination";
+ 
+ export type SessionMetadata = {
+     sessionId: string,
+@@ -18,4 +19,5 @@ export type SessionMetadataWithThread = SessionMetadata & {
+     thread: Thread,
+     /** The items of the thread, oldest first, one page at a time. */
+     history: AsyncIterable<ThreadItem[]>,
++    historyPagination?: {pages: HistoryPagination; nextCursor: string | null} | undefined,
+ }
+diff --git a/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts b/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
+index 78d6efe..3625f3b 100644
+--- a/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
++++ b/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
+@@ -564,14 +564,8 @@ describe('ACP server test', { timeout: 40_000 }, () => {
+         expect(threadResumeSpy.mock.calls.every(([params]) => params.excludeTurns === true)).toBe(true);
+         expect(resumed.additionalDirectories).toEqual(["/workspace/resume-extra"]);
+         expect(loaded.additionalDirectories).toEqual(["/workspace/load-extra"]);
+-        expect(threadResumeSpy.mock.calls[0]![0].config?.["projects"]).toEqual({
+-            "/workspace": {trust_level: "trusted"},
+-            "/workspace/resume-extra": {trust_level: "trusted"},
+-        });
+-        expect(threadResumeSpy.mock.calls[1]![0].config?.["projects"]).toEqual({
+-            "/workspace": {trust_level: "trusted"},
+-            "/workspace/load-extra": {trust_level: "trusted"},
+-        });
++        // Merely opening a shared thread must preserve its existing settings.
++        expect(threadResumeSpy.mock.calls.every(([params]) => params.config === undefined)).toBe(true);
+         expect(threadReadSpy).toHaveBeenCalledWith("thread-id");
+     });
+ 
+@@ -809,8 +803,8 @@ describe('ACP server test', { timeout: 40_000 }, () => {
+             mcpServers: [],
+         });
+ 
+-        expect(threadResumeSpy.mock.calls[0]![0].modelProvider).toBe("azure");
+-        expect(threadResumeSpy.mock.calls[1]![0].modelProvider).toBe("azure");
++        expect(threadResumeSpy.mock.calls[0]![0]).toEqual({threadId: "resume-id", excludeTurns: true});
++        expect(threadResumeSpy.mock.calls[1]![0]).toEqual({threadId: "load-id", excludeTurns: true});
+     });
+ 
+     it('tracks configured model provider auth state for resumed and loaded sessions', async () => {
+@@ -856,8 +850,8 @@ describe('ACP server test', { timeout: 40_000 }, () => {
+             mcpServers: [],
+         });
+ 
+-        expect(threadResumeSpy.mock.calls[0]![0].modelProvider).toBe("azure");
+-        expect(threadResumeSpy.mock.calls[1]![0].modelProvider).toBe("azure");
++        expect(threadResumeSpy.mock.calls[0]![0].modelProvider).toBeUndefined();
++        expect(threadResumeSpy.mock.calls[1]![0].modelProvider).toBeUndefined();
+         expect(getAccountSpy).not.toHaveBeenCalled();
+         expect(codexAcpAgent.getSessionState("resume-id")).toMatchObject({
+             account: null,
+diff --git a/src/__tests__/CodexACPAgent/cancel-turn-registration-race.test.ts b/src/__tests__/CodexACPAgent/cancel-turn-registration-race.test.ts
+index 0bcfd0d..573b131 100644
+--- a/src/__tests__/CodexACPAgent/cancel-turn-registration-race.test.ts
++++ b/src/__tests__/CodexACPAgent/cancel-turn-registration-race.test.ts
+@@ -49,7 +49,7 @@ describe("session/cancel racing Codex's turn registration", () => {
+         await turn.finish();
+     });
+ 
+-    it("does not retry on close, which tears the session down anyway", async () => {
++    it("does not interrupt on close, which detaches from the shared daemon", async () => {
+         const turn = await startPrompt();
+         const turnInterrupt = vi.spyOn(turn.codexAcpClient, "turnInterrupt")
+             .mockRejectedValue(NO_ACTIVE_TURN);
+@@ -58,7 +58,7 @@ describe("session/cancel racing Codex's turn registration", () => {
+         await turn.finish();
+         await closed;
+ 
+-        expect(turnInterrupt).toHaveBeenCalledTimes(1);
++        expect(turnInterrupt).not.toHaveBeenCalled();
+     });
+ });
+ 
+diff --git a/src/__tests__/CodexACPAgent/compact-command-lifecycle.test.ts b/src/__tests__/CodexACPAgent/compact-command-lifecycle.test.ts
+index 6bfba21..c697f22 100644
+--- a/src/__tests__/CodexACPAgent/compact-command-lifecycle.test.ts
++++ b/src/__tests__/CodexACPAgent/compact-command-lifecycle.test.ts
+@@ -4,7 +4,7 @@ import path from "node:path";
+ import {describe, expect, it, vi} from "vitest";
+ import type {ServerNotification} from "../../app-server";
+ import {CodexAppServerClient} from "../../CodexAppServerClient";
+-import {startCodexConnection} from "../../CodexJsonRpcConnection";
++import {startCodexConnection} from "../IsolatedCodexConnection";
+ import type {Turn} from "../../app-server/v2";
+ import {createCodexMockTestFixture, createTestSessionState} from "../acp-test-utils";
+ 
+diff --git a/src/__tests__/CodexACPAgent/data/session-delete-active-turn.json b/src/__tests__/CodexACPAgent/data/session-delete-active-turn.json
+index 658df34..1cbaca3 100644
+--- a/src/__tests__/CodexACPAgent/data/session-delete-active-turn.json
++++ b/src/__tests__/CodexACPAgent/data/session-delete-active-turn.json
+@@ -1,14 +1,3 @@
+-{
+-  "eventType": "request",
+-  "method": "turn/interrupt",
+-  "params": {
+-    "threadId": "session-id",
+-    "turnId": "turn-id"
+-  }
+-}
+-{
+-  "eventType": "response"
+-}
+ {
+   "eventType": "request",
+   "method": "thread/unsubscribe",
+diff --git a/src/__tests__/CodexACPAgent/elicitation-events.test.ts b/src/__tests__/CodexACPAgent/elicitation-events.test.ts
+index 6590e3d..7545c6c 100644
+--- a/src/__tests__/CodexACPAgent/elicitation-events.test.ts
++++ b/src/__tests__/CodexACPAgent/elicitation-events.test.ts
+@@ -1,3 +1,4 @@
++import {rememberServerRequest} from "../../ServerRequestIdentity";
+ import { describe, it, expect, vi, beforeEach } from 'vitest';
+ import * as acp from "@agentclientprotocol/sdk";
+ import type { McpServerElicitationRequestParams, ToolRequestUserInputParams } from '../../app-server/v2';
+@@ -254,15 +255,20 @@ describe('Elicitation Events', () => {
+             await promptPromise;
+         });
+ 
+-        it('should return cancel when no handler registered', async () => {
++        it('waits for the other client when no handler is registered', async () => {
+             const params: McpServerElicitationRequestParams = {
+                 threadId: 'non-existent-session', turnId: null, serverName: 'test-server',
+                 mode: 'form', _meta: null, message: 'Please provide info',
+                 requestedSchema: { type: 'object', properties: {} },
+             };
+ 
+-            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+-            expect(response).toEqual({ action: 'cancel', content: null, _meta: null });
++            rememberServerRequest({jsonrpc: "2.0", id: 42, method: "mcpServer/elicitation/request", params});
++            let settled = false;
++            const pending = fixture.sendServerRequest('mcpServer/elicitation/request', params).then(response => {settled = true; return response;});
++            await new Promise(resolve => setImmediate(resolve));
++            expect(settled).toBe(false);
++            fixture.sendServerNotification({method: "serverRequest/resolved", params: {threadId: params.threadId, requestId: 42}});
++            expect(await pending).toEqual({action: "cancel", content: null, _meta: null});
+         });
+ 
+         it('should not replace unsupported required form fields with permission buttons', async () => {
+diff --git a/src/__tests__/CodexACPAgent/history-pagination.test.ts b/src/__tests__/CodexACPAgent/history-pagination.test.ts
+new file mode 100644
+index 0000000..1c00530
+--- /dev/null
++++ b/src/__tests__/CodexACPAgent/history-pagination.test.ts
+@@ -0,0 +1,102 @@
++import {describe, expect, it, vi} from "vitest";
++import {HistoryPagination, HISTORY_PAGINATION_META_KEY, HISTORY_PAGE_METHOD} from "../../HistoryPagination";
++import type {Thread, ThreadItem, Turn} from "../../app-server/v2";
++import {createCodexMockTestFixture, createTestModel} from "../acp-test-utils";
++
++function messages(count: number): ThreadItem[] {
++    return Array.from({length: count}, (_, index) => ({
++        type: "agentMessage", id: String(index), text: `Message ${index}`,
++        phase: "final_answer", memoryCitation: null, delivery: null, questions: null,
++    }));
++}
++
++describe("lazy history", () => {
++    it("reads only the latest page and excludes items persisted after resume", async () => {
++        const fixture = createCodexMockTestFixture();
++        const client = fixture.getCodexAppServerClient();
++        const stored = messages(260); // Resume happened at item 249; 250–259 are live.
++        const read = vi.spyOn(client, "threadItemsList").mockImplementation(async params => {
++            expect(params.sortDirection).toBe("desc");
++            const end = Number(String(params.cursor).slice("before:".length)) + 1;
++            const start = Math.max(0, end - (params.limit ?? 100));
++            return {
++                data: stored.slice(start, end).reverse().map(item => ({
++                    item, turnId: "turn", startedAtMs: null, completedAtMs: null,
++                })),
++                nextCursor: start > 0 ? `before:${start - 1}` : null,
++                backwardsCursor: null,
++            };
++        });
++        const pages = HistoryPagination.paginated(client, "thread", "before:249");
++        const tail = await pages.read();
++        expect(tail.items.map(item => item.id)).toEqual(stored.slice(150, 250).map(item => item.id));
++        expect(read).toHaveBeenCalledTimes(1); // No prefetch of unseen history.
++        const middle = await pages.read(tail.nextCursor);
++        expect(await pages.read(tail.nextCursor)).toEqual(middle); // Safe retry.
++        const first = await pages.read(middle.nextCursor);
++        expect([...first.items, ...middle.items, ...tail.items]).toEqual(stored.slice(0, 250));
++        expect(first.nextCursor).toBeNull();
++        await expect(HistoryPagination.paginated(client, "another", "before:249")
++            .read(tail.nextCursor)).rejects.toThrow("different session load");
++    });
++
++    it("does not read later live items when resume had an empty snapshot", async () => {
++        const fixture = createCodexMockTestFixture();
++        const client = fixture.getCodexAppServerClient();
++        const read = vi.spyOn(client, "threadItemsList");
++        expect(await HistoryPagination.paginated(client, "thread", null).read())
++            .toEqual({items: [], nextCursor: null});
++        expect(read).not.toHaveBeenCalled();
++    });
++
++    it("keeps legacy history complete while replaying only its tail initially", async () => {
++        const items = messages(250);
++        const pages = HistoryPagination.legacy(items);
++        const tail = await pages.read();
++        const middle = await pages.read(tail.nextCursor);
++        const first = await pages.read(middle.nextCursor);
++        expect([tail.items.length, middle.items.length, first.items.length]).toEqual([100, 100, 50]);
++        expect([...first.items, ...middle.items, ...tail.items]).toEqual(items);
++        expect(first.nextCursor).toBeNull();
++        expect(await pages.read(tail.nextCursor)).toEqual(middle);
++    });
++
++    it("negotiates tail replay and returns older updates without appending them to live notifications", async () => {
++        const fixture = createCodexMockTestFixture();
++        const client = fixture.getCodexAcpClient();
++        const server = fixture.getCodexAppServerClient();
++        client.readAuthRequirement = vi.fn().mockResolvedValue({required: false, account: null});
++        client.getAccount = vi.fn().mockResolvedValue({account: null, requiresOpenaiAuth: false});
++        client.listSkills = vi.fn().mockResolvedValue({data: []});
++        const model = createTestModel();
++        server.listModels = vi.fn().mockResolvedValue({data: [model], nextCursor: null});
++        const items = messages(250);
++        const thread = {id: "history", historyMode: "legacy", preview: "Original title", turns: []} as unknown as Thread;
++        server.threadResume = vi.fn().mockResolvedValue({
++            thread, model: model.id, modelProvider: "openai", cwd: "/workspace",
++            approvalPolicy: "never", sandbox: {type: "dangerFullAccess"},
++            reasoningEffort: model.defaultReasoningEffort,
++        });
++        server.threadReadWithHistory = vi.fn().mockResolvedValue({thread: {...thread, turns: [{items} as Turn]}});
++        const agent = fixture.getCodexAcpAgent();
++        await agent.initialize({protocolVersion: 1, clientCapabilities: {
++            _meta: {[HISTORY_PAGINATION_META_KEY]: {version: 1}},
++        }});
++        const loaded = await agent.loadSession({sessionId: thread.id, cwd: "/workspace", mcpServers: []});
++        const replay = fixture.getAcpConnectionEvents([]).filter(event => event.method === "sessionUpdate")
++            .map(event => event.args[0].update).filter(update => update.sessionUpdate === "agent_message_chunk");
++        expect(replay.map(update => update.messageId)).toEqual(items.slice(150).map(item => item.id));
++        expect(agent.getSessionState(thread.id).sessionTitle).toBe("Original title");
++        fixture.clearAcpConnectionDump();
++        fixture.clearCodexConnectionDump();
++        const cursor = (loaded._meta![HISTORY_PAGINATION_META_KEY] as {nextCursor: string}).nextCursor;
++        const older = await agent.extMethod(HISTORY_PAGE_METHOD, {sessionId: thread.id, cursor});
++        expect((older["updates"] as {messageId: string}[]).map(update => update.messageId))
++            .toEqual(items.slice(50, 150).map(item => item.id));
++        expect(await agent.extMethod(HISTORY_PAGE_METHOD, {sessionId: thread.id, cursor})).toEqual(older);
++        expect(fixture.getAcpConnectionEvents([])).toEqual([]);
++        expect(fixture.getCodexConnectionEvents([])).toEqual([]); // No resume, prompt, or writes.
++        await agent.closeSession({sessionId: thread.id});
++        await expect(agent.extMethod(HISTORY_PAGE_METHOD, {sessionId: thread.id, cursor})).rejects.toThrow();
++    });
++});
+diff --git a/src/__tests__/CodexACPAgent/mcp-config-merge.test.ts b/src/__tests__/CodexACPAgent/mcp-config-merge.test.ts
+index f995946..58f3a70 100644
+--- a/src/__tests__/CodexACPAgent/mcp-config-merge.test.ts
++++ b/src/__tests__/CodexACPAgent/mcp-config-merge.test.ts
+@@ -5,7 +5,7 @@ import path from "node:path";
+ import fs from "node:fs";
+ import os from "node:os";
+ import type {McpServerStdio} from "@agentclientprotocol/sdk";
+-import {startCodexConnection} from "../../CodexJsonRpcConnection";
++import {startCodexConnection} from "../IsolatedCodexConnection";
+ import {createBaseTestFixture, removeDirectoryWithRetry, type TestFixture} from "../acp-test-utils";
+ 
+ describe('MCP config merge across configured MCP servers and ACP request', { timeout: 40_000 }, () => {
+diff --git a/src/__tests__/CodexACPAgent/process-exit-error.test.ts b/src/__tests__/CodexACPAgent/process-exit-error.test.ts
+index df34595..4475b12 100644
+--- a/src/__tests__/CodexACPAgent/process-exit-error.test.ts
++++ b/src/__tests__/CodexACPAgent/process-exit-error.test.ts
+@@ -4,7 +4,7 @@ import * as os from 'node:os';
+ import * as path from 'node:path';
+ import { once } from 'node:events';
+ import * as acp from '@agentclientprotocol/sdk';
+-import { startCodexConnection } from '../../CodexJsonRpcConnection';
++import { startCodexConnection } from '../IsolatedCodexConnection';
+ import { CodexAppServerClient } from '../../CodexAppServerClient';
+ import { CodexAcpClient } from '../../CodexAcpClient';
+ import { CodexAcpServer } from '../../CodexAcpServer';
+diff --git a/src/__tests__/CodexACPAgent/session-close.test.ts b/src/__tests__/CodexACPAgent/session-close.test.ts
+index 9207f37..ca96179 100644
+--- a/src/__tests__/CodexACPAgent/session-close.test.ts
++++ b/src/__tests__/CodexACPAgent/session-close.test.ts
+@@ -52,13 +52,14 @@ describe("ACP session close", () => {
+         expect(fixture.getAcpConnectionEvents([])).toEqual([]);
+     });
+ 
+-    it("interrupts active turns before unsubscribing", async () => {
++    it("leaves another client's active turn running when unsubscribing", async () => {
+         const {fixture, codexAcpAgent} = await createSession();
+         codexAcpAgent.getSessionState(sessionId).currentTurnId = "turn-id";
+ 
+         await codexAcpAgent.closeSession({sessionId});
+ 
+-        await expect(fixture.getCodexConnectionDump([])).toMatchFileSnapshot("data/session-close-active-turn.json");
++        expect(fixture.getCodexConnectionEvents([]).filter(event => event.eventType === "request")
++            .map(event => event.method)).toEqual(["thread/unsubscribe"]);
+         expect(() => codexAcpAgent.getSessionState(sessionId)).toThrow(`Session ${sessionId} not found`);
+     });
+ 
+@@ -81,6 +82,8 @@ describe("ACP session close", () => {
+         const {fixture, codexAcpAgent} = await createSession();
+         const turnStart = deferred<TurnStartResponse>();
+         const turnStartCalled = deferred<void>();
++        const waitForTurn = vi.spyOn(fixture.getCodexAppServerClient(), "awaitTurnCompleted")
++            .mockResolvedValue({threadId: sessionId, turn: createCompletedTurn("turn-id")});
+ 
+         vi.spyOn(fixture.getCodexAppServerClient(), "turnStart").mockImplementation(async () => {
+             turnStartCalled.resolve();
+@@ -108,10 +111,11 @@ describe("ACP session close", () => {
+         turnStart.resolve(createTurnStartResponse("turn-id"));
+ 
+         await vi.waitFor(() => {
+-            const lateRequestMethods = fixture.getCodexConnectionEvents([])
+-                .flatMap(event => event.eventType === "request" ? [event.method] : []);
+-            expect(lateRequestMethods).toContain("turn/interrupt");
++            expect(waitForTurn).toHaveBeenCalledWith(sessionId, "turn-id");
+         });
++        expect(fixture.getCodexConnectionEvents([])
++            .flatMap(event => event.eventType === "request" ? [event.method] : []))
++            .not.toContain("turn/interrupt");
+     });
+ 
+     it("does not start a turn after close while prompt startup is still setting the skill roots", async () => {
+@@ -143,10 +147,9 @@ describe("ACP session close", () => {
+         expect(() => codexAcpAgent.getSessionState(sessionId)).toThrow(`Session ${sessionId} not found`);
+     });
+ 
+-    it("does not hang when close interrupt fails during an active prompt", async () => {
++    it("detaches a Zed-started active prompt without interrupting the daemon turn", async () => {
+         const {fixture, codexAcpAgent} = await createSession();
+-        const turnInterruptSpy = vi.spyOn(fixture.getCodexAcpClient(), "turnInterrupt")
+-            .mockRejectedValue(new Error("interrupt failed"));
++        const turnInterruptSpy = vi.spyOn(fixture.getCodexAcpClient(), "turnInterrupt");
+ 
+         vi.spyOn(fixture.getCodexAppServerClient(), "turnStart").mockResolvedValue(createTurnStartResponse("turn-id"));
+ 
+@@ -163,10 +166,7 @@ describe("ACP session close", () => {
+         await expect(codexAcpAgent.closeSession({sessionId})).resolves.toEqual({});
+         await expect(promptPromise).resolves.toMatchObject({stopReason: "cancelled"});
+ 
+-        expect(turnInterruptSpy).toHaveBeenCalledWith({
+-            threadId: sessionId,
+-            turnId: "turn-id",
+-        });
++        expect(turnInterruptSpy).not.toHaveBeenCalled();
+         await expect(fixture.getCodexConnectionDump([])).toMatchFileSnapshot(
+             "data/session-close-interrupt-failed.json"
+         );
+@@ -453,16 +453,14 @@ describe("ACP session close", () => {
+         expect(closeSessionSpy).toHaveBeenCalledWith(sessionId);
+     });
+ 
+-    it("does not route stale turn notifications into a reopened session", async () => {
++    it("reattaches to a late-started daemon turn after closing the original prompt", async () => {
+         const {fixture, codexAcpAgent, codexAcpClient} = await createSession();
+         const oldTurnStart = deferred<TurnStartResponse>();
+         const turnStartSpy = vi.spyOn(fixture.getCodexAppServerClient(), "turnStart")
+-            .mockReturnValueOnce(oldTurnStart.promise)
+-            .mockResolvedValueOnce(createTurnStartResponse("new-turn"));
+-        vi.spyOn(fixture.getCodexAppServerClient(), "awaitTurnCompleted").mockResolvedValue({
+-            threadId: sessionId,
+-            turn: createCompletedTurn("new-turn"),
+-        });
++            .mockReturnValueOnce(oldTurnStart.promise);
++        const turnCompleted = deferred<{threadId: string, turn: TurnStartResponse["turn"]}>();
++        const waitForTurn = vi.spyOn(fixture.getCodexAppServerClient(), "awaitTurnCompleted")
++            .mockReturnValue(turnCompleted.promise);
+ 
+         const promptPromise = codexAcpAgent.prompt({
+             sessionId,
+@@ -475,32 +473,28 @@ describe("ACP session close", () => {
+         await expect(codexAcpAgent.closeSession({sessionId})).resolves.toEqual({});
+         await expect(promptPromise).resolves.toMatchObject({stopReason: "cancelled"});
+ 
++        oldTurnStart.resolve(createTurnStartResponse("old-turn"));
++        await vi.waitFor(() => expect(waitForTurn).toHaveBeenCalledWith(sessionId, "old-turn"));
++        expect(fixture.getCodexConnectionEvents([])
++            .flatMap(event => event.eventType === "request" ? [event.method] : []))
++            .not.toContain("turn/interrupt");
++
+         vi.spyOn(codexAcpClient, "resumeSession").mockResolvedValue(createSessionMetadata());
+         await codexAcpAgent.resumeSession({
+             sessionId,
+             cwd: "/test/cwd",
+             mcpServers: [],
+         });
+-        await codexAcpAgent.prompt({
+-            sessionId,
+-            prompt: [{type: "text", text: "new prompt"}],
+-        });
+-
+         fixture.clearAcpConnectionDump();
+-        oldTurnStart.resolve(createTurnStartResponse("old-turn"));
+-
+-        await vi.waitFor(() => {
+-            const requestMethods = fixture.getCodexConnectionEvents([])
+-                .flatMap(event => event.eventType === "request" ? [event.method] : []);
+-            expect(requestMethods).toContain("turn/interrupt");
++        fixture.sendServerNotification({
++            method: "turn/started",
++            params: {threadId: sessionId, turn: createTurnStartResponse("old-turn").turn},
+         });
+-
+         fixture.sendServerNotification({
+             method: "item/agentMessage/delta",
+-            params: {threadId: sessionId, turnId: "old-turn", itemId: "old-item", delta: "stale"},
++            params: {threadId: sessionId, turnId: "old-turn", itemId: "old-item", delta: "Continued in the daemon"},
+         });
+-        await waitForMicrotasks();
+-        expect(fixture.getAcpConnectionEvents([])).toEqual([]);
++        await vi.waitFor(() => expect(fixture.getAcpConnectionDump([])).toContain("Continued in the daemon"));
+ 
+         fixture.sendServerNotification({
+             method: "turn/completed",
+@@ -509,20 +503,35 @@ describe("ACP session close", () => {
+                 turn: createCompletedTurn("old-turn"),
+             },
+         });
+-        fixture.sendServerNotification({
+-            method: "item/agentMessage/delta",
+-            params: {threadId: sessionId, turnId: "new-turn", itemId: "new-item", delta: "fresh"},
+-        });
++        turnCompleted.resolve({threadId: sessionId, turn: createCompletedTurn("old-turn")});
++    });
+ 
+-        await vi.waitFor(() => {
+-            expect(fixture.getAcpConnectionDump([])).toContain("fresh");
+-        });
+-        expect(fixture.getAcpConnectionDump([])).not.toContain("stale");
++    it("does not interrupt an active turn when the ACP transport closes", async () => {
++        const transport = new AbortController();
++        const request = new AbortController();
++        const {fixture, codexAcpAgent} = await createSession({transportSignal: transport.signal});
++        vi.spyOn(fixture.getCodexAppServerClient(), "turnStart")
++            .mockResolvedValue(createTurnStartResponse("turn-id"));
++        const turnCompleted = deferred<{threadId: string, turn: TurnStartResponse["turn"]}>();
++        vi.spyOn(fixture.getCodexAppServerClient(), "awaitTurnCompleted")
++            .mockReturnValue(turnCompleted.promise);
++        const interrupt = vi.spyOn(fixture.getCodexAcpClient(), "turnInterrupt");
++        const prompt = codexAcpAgent.prompt({sessionId, prompt: [{type: "text", text: "Keep working"}]}, request.signal);
++        await vi.waitFor(() => expect(codexAcpAgent.getSessionState(sessionId).currentTurnId).toBe("turn-id"));
++
++        // The ACP SDK closes the connection signal before aborting inbound RPCs.
++        transport.abort();
++        request.abort();
++
++        await expect(prompt).resolves.toMatchObject({stopReason: "cancelled"});
++        expect(interrupt).not.toHaveBeenCalled();
++        turnCompleted.resolve({threadId: sessionId, turn: createCompletedTurn("turn-id")});
+     });
+ });
+ 
+ async function createSession(options: {
+     mcpServers?: McpServer[],
++    transportSignal?: AbortSignal,
+     configure?: (params: {
+         fixture: CodexMockTestFixture,
+         codexAcpAgent: CodexAcpServer,
+@@ -533,7 +542,7 @@ async function createSession(options: {
+     codexAcpAgent: CodexAcpServer,
+     codexAcpClient: CodexAcpClient,
+ }> {
+-    const fixture = createCodexMockTestFixture();
++    const fixture = createCodexMockTestFixture(undefined, undefined, options.transportSignal);
+     const codexAcpAgent = fixture.getCodexAcpAgent();
+     const codexAcpClient = fixture.getCodexAcpClient();
+     const model = createTestModel();
+diff --git a/src/__tests__/CodexACPAgent/session-delete.test.ts b/src/__tests__/CodexACPAgent/session-delete.test.ts
+index 2afdc6f..2a26429 100644
+--- a/src/__tests__/CodexACPAgent/session-delete.test.ts
++++ b/src/__tests__/CodexACPAgent/session-delete.test.ts
+@@ -52,7 +52,7 @@ describe("ACP session delete", () => {
+         );
+     });
+ 
+-    it("interrupts active turns before archiving", async () => {
++    it("unsubscribes before explicitly archiving an externally active thread", async () => {
+         const {fixture, codexAcpAgent} = await createSession();
+         codexAcpAgent.getSessionState(sessionId).currentTurnId = "turn-id";
+ 
+diff --git a/src/__tests__/CodexACPAgent/shared-session.test.ts b/src/__tests__/CodexACPAgent/shared-session.test.ts
+new file mode 100644
+index 0000000..c8cf986
+--- /dev/null
++++ b/src/__tests__/CodexACPAgent/shared-session.test.ts
+@@ -0,0 +1,69 @@
++import {describe, expect, it, vi} from "vitest";
++import {createCodexMockTestFixture, createTestModel} from "../acp-test-utils";
++import type {Thread} from "../../app-server/v2";
++import {rememberServerRequest} from "../../ServerRequestIdentity";
++
++describe("shared app-server sessions", () => {
++    async function loadSharedSession() {
++        const fixture = createCodexMockTestFixture();
++        const client = fixture.getCodexAcpClient();
++        const server = fixture.getCodexAppServerClient();
++        client.readAuthRequirement = vi.fn().mockResolvedValue({required: false, account: null});
++        client.getAccount = vi.fn().mockResolvedValue({account: null, requiresOpenaiAuth: false});
++        client.listSkills = vi.fn().mockResolvedValue({data: []});
++        const model = createTestModel();
++        server.listModels = vi.fn().mockResolvedValue({data: [model], nextCursor: null});
++        const thread = {id: "shared-thread", historyMode: "legacy", turns: []} as unknown as Thread;
++        server.threadResume = vi.fn().mockResolvedValue({
++            thread, model: model.id, modelProvider: "openai", cwd: "/workspace",
++            approvalPolicy: "never", sandbox: {type: "dangerFullAccess"},
++            reasoningEffort: model.defaultReasoningEffort,
++        });
++        server.threadReadWithHistory = vi.fn().mockResolvedValue({thread});
++        const agent = fixture.getCodexAcpAgent();
++        await agent.initialize({protocolVersion: 1, clientCapabilities: {}});
++        await agent.loadSession({sessionId: thread.id, cwd: "/workspace", mcpServers: []});
++        fixture.clearAcpConnectionDump();
++        return {fixture, agent, server, thread};
++    }
++
++    it("forwards another client's messages without a Zed prompt and detaches without interrupting", async () => {
++        const {fixture, agent, server, thread} = await loadSharedSession();
++        expect(server.threadResume).toHaveBeenCalledWith({threadId: thread.id, excludeTurns: true});
++        fixture.sendServerNotification({method: "turn/started", params: {
++            threadId: thread.id, turn: {id: "external-turn", status: "inProgress", items: []},
++        }});
++        fixture.sendServerNotification({method: "item/started", params: {
++            threadId: thread.id, turnId: "external-turn", item: {
++                id: "external-user", type: "userMessage", clientId: "desktop",
++                content: [{type: "text", text: "From Desktop", text_elements: []}],
++            },
++        }});
++        fixture.sendServerNotification({method: "item/agentMessage/delta", params: {
++            threadId: thread.id, turnId: "external-turn", itemId: "external-answer", delta: "Shared answer",
++        }});
++        await vi.waitFor(() => expect(fixture.getAcpConnectionEvents([])
++            .filter(event => event.method === "sessionUpdate")
++            .map(event => event.args[0].update)
++            .filter(update => ["user_message_chunk", "agent_message_chunk"].includes(update.sessionUpdate))
++            .map(update => update.content.text)).toEqual(["From Desktop", "Shared answer"]));
++        expect(agent.getSessionState(thread.id).currentTurnId).toBe("external-turn");
++        fixture.clearCodexConnectionDump();
++        await agent.closeSession({sessionId: thread.id});
++        expect(fixture.getCodexConnectionEvents([]).filter(event => event.eventType === "request")
++            .map(event => event.method)).toEqual(["thread/unsubscribe"]);
++    });
++
++    it("does not auto-deny a pending approval owned by another client", async () => {
++        const {fixture, thread} = await loadSharedSession();
++        const params = {threadId: thread.id, turnId: "external-turn", itemId: "command", command: "ls"};
++        rememberServerRequest({jsonrpc: "2.0", method: "item/commandExecution/requestApproval", id: 42, params});
++        const settled = vi.fn();
++        const response = fixture.sendServerRequest("item/commandExecution/requestApproval", params).then(settled);
++        await new Promise(resolve => setImmediate(resolve));
++        expect(settled).not.toHaveBeenCalled();
++        fixture.sendServerNotification({method: "serverRequest/resolved", params: {threadId: thread.id, requestId: 42}});
++        await response;
++        expect(settled).toHaveBeenCalledOnce();
++    });
++});
+diff --git a/src/__tests__/IsolatedCodexConnection.ts b/src/__tests__/IsolatedCodexConnection.ts
+new file mode 100644
+index 0000000..817d809
+--- /dev/null
++++ b/src/__tests__/IsolatedCodexConnection.ts
+@@ -0,0 +1,24 @@
++import {spawn, type ChildProcessWithoutNullStreams} from "node:child_process";
++import {createRequire} from "node:module";
++import * as rpc from "vscode-jsonrpc/node";
++import {afterEach} from "vitest";
++import type {CodexConnection} from "../CodexJsonRpcConnection";
++import {createJSONRPCReader, createJSONRPCWriter} from "../StdUtils";
++
++const ownedProcesses = new Set<ChildProcessWithoutNullStreams>();
++afterEach(() => {
++    for (const child of ownedProcesses) child.kill();
++    ownedProcesses.clear();
++});
++
++/** Isolated auth/config fixtures must never log into or change the user's daemon. */
++export function startCodexConnection(codexPath?: string, env?: NodeJS.ProcessEnv): CodexConnection {
++    const child = codexPath
++        ? spawn(codexPath, ["app-server"], {env: env ?? process.env, shell: process.platform === "win32"})
++        : spawn(process.execPath, [createRequire(import.meta.url).resolve("@openai/codex/bin/codex.js"), "app-server"], {env: env ?? process.env});
++    ownedProcesses.add(child);
++    const connection = rpc.createMessageConnection(createJSONRPCReader(child.stdout), createJSONRPCWriter(child.stdin));
++    connection.listen();
++    child.on("exit", () => {ownedProcesses.delete(child); connection.dispose();});
++    return {connection, process: child};
++}
+diff --git a/src/__tests__/McpStartupTracker.test.ts b/src/__tests__/McpStartupTracker.test.ts
+index 8e1b39b..dd7045d 100644
+--- a/src/__tests__/McpStartupTracker.test.ts
++++ b/src/__tests__/McpStartupTracker.test.ts
+@@ -3,7 +3,7 @@ import {tmpdir} from "node:os";
+ import path from "node:path";
+ import {afterEach, describe, expect, it} from "vitest";
+ import {CodexAppServerClient} from "../CodexAppServerClient";
+-import {startCodexConnection} from "../CodexJsonRpcConnection";
++import {startCodexConnection} from "./IsolatedCodexConnection";
+ import {McpOauthCompletions} from "../mcp/McpOauthCompletions";
+ import {McpStartupTracker} from "../mcp/McpStartupTracker";
+ 
+diff --git a/src/__tests__/acp-test-utils.ts b/src/__tests__/acp-test-utils.ts
+index 94b0c08..0e70e15 100644
+--- a/src/__tests__/acp-test-utils.ts
++++ b/src/__tests__/acp-test-utils.ts
+@@ -3,7 +3,8 @@ import type {CreateElicitationResponse, McpServerStdio, RequestPermissionRespons
+ import {CodexAcpClient} from '../CodexAcpClient';
+ import {ToolCallReports} from "../ToolCallReports";
+ import {CodexAppServerClient, type CodexConnectionEvent} from '../CodexAppServerClient';
+-import {type CodexConnection, startCodexConnection} from "../CodexJsonRpcConnection";
++import type {CodexConnection} from "../CodexJsonRpcConnection";
++import {startCodexConnection} from "./IsolatedCodexConnection";
+ import {CodexAcpServer, type CodexProcessState, type SessionState} from "../CodexAcpServer";
+ import {ACPSessionConnection, type AcpClientConnection} from "../ACPSessionConnection";
+ import type {ServerNotification} from "../app-server";
+@@ -95,6 +96,7 @@ export interface ConnectionConfig {
+     getExitCode: () => number | null;
+     acpConnection?: AcpConnectionConfig;
+     codexProcessState?: CodexProcessState;
++    transportSignal?: AbortSignal;
+ }
+ 
+ export function createBaseTestFixture(config: ConnectionConfig): TestFixture {
+@@ -115,6 +117,7 @@ export function createBaseTestFixture(config: ConnectionConfig): TestFixture {
+         config.getExitCode,
+         undefined,
+         config.codexProcessState,
++        config.transportSignal,
+     );
+ 
+     const transportEvents: CodexConnectionEvent[] = [];
+@@ -278,6 +281,7 @@ export interface CodexMockTestFixture extends TestFixture {
+ export function createCodexMockTestFixture(
+     restartCodexClient?: () => Promise<CodexAcpClient>,
+     process?: CodexConnection["process"],
++    transportSignal?: AbortSignal,
+ ): CodexMockTestFixture {
+     let unhandledNotificationHandler: ((notification: any) => void) | null = null;
+     const requestHandlers = new Map<string, (params: unknown) => Promise<unknown>>();
+@@ -333,6 +337,7 @@ export function createCodexMockTestFixture(
+     const baseFixture = createBaseTestFixture({
+         connection: mockCodexConnection,
+         getExitCode: () => null,
++        ...(transportSignal ? {transportSignal} : {}),
+         ...(process ? {codexProcessState: {
+             connection: {connection: mockCodexConnection, process},
+             codexPath: undefined,
+diff --git a/src/index.ts b/src/index.ts
+index 1975930..df3fbae 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -17,6 +17,7 @@ import {
+     SESSION_STEERING_METHOD,
+ } from "./AcpExtensions";
+ import {ASYNC_TASK_STOP_METHOD} from "./async-tasks/AsyncTaskExtension";
++import {HISTORY_PAGE_METHOD} from "./HistoryPagination";
+ 
+ const emptyExtensionParamsParser = z.preprocess(
+     (params) => params ?? {},
+@@ -50,6 +51,11 @@ const asyncTaskStopParamsParser = z.object({
+     asyncTaskId: z.string().trim().min(1),
+ }).passthrough();
+ 
++const historyPageParamsParser = z.object({
++    sessionId: z.string(),
++    cursor: z.string(),
++}).passthrough();
++
+ if (process.argv.includes("--version")) {
+     console.log(`${packageJson.name} ${packageJson.version}`);
+     process.exit(0);
+@@ -115,7 +121,7 @@ function startAcpServer() {
+ 
+     const acpJsonStream = createJsonStream(process.stdin, process.stdout);
+ 
+-    function createAgent(connection: acp.AgentContext): CodexAcpServer {
++    function createAgent(connection: acp.AgentContext, transportSignal: AbortSignal): CodexAcpServer {
+         const appServerClient = new CodexAppServerClient(codexProcessState.connection.connection);
+         const codexClient = new CodexAcpClient(appServerClient, config, modelProvider);
+         return new CodexAcpServer(
+@@ -125,6 +131,7 @@ function startAcpServer() {
+             undefined,
+             undefined,
+             codexProcessState,
++            transportSignal,
+         );
+     }
+ 
+@@ -138,7 +145,7 @@ function startAcpServer() {
+ 
+     acp.agent({name: packageJson.name})
+         .onConnect((connection) => {
+-            const agent = createAgent(connection.client);
++            const agent = createAgent(connection.client, connection.signal);
+             codexAcpServer = agent;
+             connection.signal.addEventListener("abort", () => {
+                 if (codexAcpServer === agent) {
+@@ -169,5 +176,6 @@ function startAcpServer() {
+         .onRequest(SESSION_STEERING_METHOD, sessionSteerParamsParser, (ctx) => getAgent().extMethod(SESSION_STEERING_METHOD, ctx.params))
+         .onRequest(ASYNC_TASK_STOP_METHOD, asyncTaskStopParamsParser, (ctx) => getAgent().extMethod(ASYNC_TASK_STOP_METHOD, ctx.params))
+         .onRequest(GOAL_CONTROL_METHOD, goalControlParamsParser, (ctx) => getAgent().extMethod(GOAL_CONTROL_METHOD, ctx.params))
++        .onRequest(HISTORY_PAGE_METHOD, historyPageParamsParser, (ctx) => getAgent().extMethod(HISTORY_PAGE_METHOD, ctx.params))
+         .connect(acpJsonStream);
+ }
+diff --git a/src/subagents/CodexSubagentSubscriptions.ts b/src/subagents/CodexSubagentSubscriptions.ts
+index 27998e0..274bb68 100644
+--- a/src/subagents/CodexSubagentSubscriptions.ts
++++ b/src/subagents/CodexSubagentSubscriptions.ts
+@@ -5,6 +5,7 @@ import type {
+ } from "../CodexAppServerClient";
+ import type {ServerNotification} from "../app-server";
+ import {isRootAgentPath} from "./CodexAgentPath";
++import {copyServerRequestIdentity} from "../ServerRequestIdentity";
+ 
+ type Subscription = {
+     rootSessionId: string;
+@@ -91,7 +92,7 @@ export class CodexSubagentSubscriptions {
+                 const sessionId = await this.interactionSessionId(current, targetSessionId);
+                 if (sessionId === null) return {decision: "cancel"};
+                 return await current.approvalHandler.handleCommandExecution(
+-                    {...params, threadId: sessionId},
++                    copyServerRequestIdentity(params, {...params, threadId: sessionId}),
+                 );
+             },
+             handleFileChange: async (params) => {
+@@ -100,7 +101,7 @@ export class CodexSubagentSubscriptions {
+                 const sessionId = await this.interactionSessionId(current, targetSessionId);
+                 if (sessionId === null) return {decision: "cancel"};
+                 return await current.approvalHandler.handleFileChange(
+-                    {...params, threadId: sessionId},
++                    copyServerRequestIdentity(params, {...params, threadId: sessionId}),
+                 );
+             },
+             handlePermissionsRequest: async (params) => {
+@@ -109,7 +110,7 @@ export class CodexSubagentSubscriptions {
+                 const sessionId = await this.interactionSessionId(current, targetSessionId);
+                 if (sessionId === null) return {permissions: {}, scope: "turn", strictAutoReview: false};
+                 return await current.approvalHandler.handlePermissionsRequest(
+-                    {...params, threadId: sessionId},
++                    copyServerRequestIdentity(params, {...params, threadId: sessionId}),
+                 );
+             },
+         });
+@@ -120,7 +121,7 @@ export class CodexSubagentSubscriptions {
+                 const sessionId = await this.interactionSessionId(current, targetSessionId);
+                 if (sessionId === null) return {action: "cancel", content: null, _meta: null};
+                 return await current.elicitationHandler.handleElicitation(
+-                    {...params, threadId: sessionId},
++                    copyServerRequestIdentity(params, {...params, threadId: sessionId}),
+                 );
+             },
+             handleUserInput: async (params) => {
+@@ -129,7 +130,7 @@ export class CodexSubagentSubscriptions {
+                 const sessionId = await this.interactionSessionId(current, targetSessionId);
+                 if (sessionId === null) return {answers: {}};
+                 return await current.elicitationHandler.handleUserInput(
+-                    {...params, threadId: sessionId},
++                    copyServerRequestIdentity(params, {...params, threadId: sessionId}),
+                 );
+             },
+         });

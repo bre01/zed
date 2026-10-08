@@ -1,4 +1,4 @@
-use crate::{AcpThread, ElicitationStore};
+use crate::{AcpThread, AgentThreadEntry, ElicitationStore};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -88,6 +88,13 @@ pub fn build_terminal_auth_task(
     }
 }
 
+pub const HISTORY_PAGINATION_META_KEY: &str = "zed.dev/historyPagination";
+
+pub struct SessionHistoryPage {
+    pub entries: Vec<AgentThreadEntry>,
+    pub next_cursor: Option<String>,
+}
+
 pub trait AgentConnection {
     fn agent_id(&self) -> AgentId;
 
@@ -107,6 +114,16 @@ pub trait AgentConnection {
     /// Whether this agent supports loading existing sessions.
     fn supports_load_session(&self) -> bool {
         false
+    }
+
+    /// Read an older history page without resuming or altering the live session.
+    fn load_history_page(
+        self: Rc<Self>,
+        _session_id: acp::SessionId,
+        _cursor: String,
+        _cx: &mut App,
+    ) -> Task<Result<SessionHistoryPage>> {
+        Task::ready(Err(anyhow::anyhow!("History pagination is not supported")))
     }
 
     /// Load an existing session by ID.
@@ -766,6 +783,7 @@ mod test_support {
 
     #[derive(Clone)]
     pub struct StubAgentConnection {
+        next_history_page: Arc<Mutex<Option<SessionHistoryPage>>>,
         sessions: Arc<Mutex<HashMap<acp::SessionId, Session>>>,
         permission_requests: HashMap<acp::ToolCallId, PermissionOptions>,
         next_prompt_updates: Arc<Mutex<Vec<acp::SessionUpdate>>>,
@@ -789,6 +807,7 @@ mod test_support {
     impl StubAgentConnection {
         pub fn new() -> Self {
             Self {
+                next_history_page: Arc::default(),
                 next_prompt_updates: Default::default(),
                 permission_requests: HashMap::default(),
                 sessions: Arc::default(),
@@ -801,6 +820,10 @@ mod test_support {
 
         pub fn set_next_prompt_updates(&self, updates: Vec<acp::SessionUpdate>) {
             *self.next_prompt_updates.lock() = updates;
+        }
+
+        pub fn set_next_history_page(&self, page: SessionHistoryPage) {
+            *self.next_history_page.lock() = Some(page);
         }
 
         pub fn with_permission_requests(
@@ -907,6 +930,19 @@ mod test_support {
     }
 
     impl AgentConnection for StubAgentConnection {
+        fn load_history_page(
+            self: Rc<Self>,
+            _session_id: acp::SessionId,
+            _cursor: String,
+            _cx: &mut App,
+        ) -> Task<Result<SessionHistoryPage>> {
+            Task::ready(
+                self.next_history_page
+                    .lock()
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("No history page configured")),
+            )
+        }
         fn agent_id(&self) -> AgentId {
             self.agent_id.clone()
         }

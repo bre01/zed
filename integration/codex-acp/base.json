@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/agentclientprotocol/codex-acp.git",
+  "commit": "4583cb3978276c2b7ea87fcfa5ae66e1e9817f13",
+  "patch": "shared-server.patch",
+  "license": "Apache-2.0"
+}

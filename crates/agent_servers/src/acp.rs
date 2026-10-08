@@ -1,6 +1,6 @@
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
-    AgentSessionListResponse, ElicitationStore,
+    AgentSessionListResponse, ElicitationStore, HISTORY_PAGINATION_META_KEY, SessionHistoryPage,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::{
@@ -496,6 +496,14 @@ struct PendingAcpSession {
 struct SessionConfigResponse {
     modes: Option<acp::SessionModeState>,
     config_options: Option<Vec<acp::SessionConfigOption>>,
+    history_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryPageResponse {
+    updates: Vec<acp::SessionUpdate>,
+    next_cursor: Option<String>,
 }
 
 #[derive(Clone)]
@@ -767,6 +775,10 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
+        (
+            HISTORY_PAGINATION_META_KEY.into(),
+            serde_json::json!({"version": 1}),
+        ),
     ]);
 
     if agent_id.as_ref() == CURSOR_ID {
@@ -1300,6 +1312,9 @@ impl AcpConnection {
                             }
                         };
 
+                    thread.update(cx, |thread, cx| {
+                        thread.set_history_cursor(response.history_cursor, cx);
+                    });
                     let (modes, config_options) =
                         config_state(response.modes, response.config_options);
 
@@ -1799,6 +1814,72 @@ impl AgentConnection for AcpConnection {
         self.agent_capabilities.load_session
     }
 
+    fn load_history_page(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        cursor: String,
+        cx: &mut App,
+    ) -> Task<Result<SessionHistoryPage>> {
+        let request = match agent_client_protocol::UntypedMessage::new(
+            "_zed/history/page",
+            &serde_json::json!({"sessionId": session_id, "cursor": cursor}),
+        ) {
+            Ok(request) => request,
+            Err(error) => return Task::ready(Err(error.into())),
+        };
+        let Some(thread) = self
+            .sessions
+            .borrow()
+            .get(&session_id)
+            .and_then(|session| session.thread.upgrade())
+        else {
+            return Task::ready(Err(anyhow!("Session is no longer open")));
+        };
+        let project = thread.read(cx).project().clone();
+        let connection = self.connection.clone();
+        cx.spawn(async move |cx| {
+            let response = connection
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(map_acp_error)?;
+            let page: HistoryPageResponse = cx
+                .background_spawn(async move { serde_json::from_value(response) })
+                .await?;
+            let action_log = cx.new(|_| ActionLog::new(project.clone()));
+            // This temporary thread is never registered with the connection.
+            // Applying historical updates here preserves live tool and plan state.
+            let history_thread: Entity<AcpThread> = cx.new(|cx| {
+                AcpThread::new(
+                    None,
+                    None,
+                    None,
+                    self,
+                    project,
+                    action_log,
+                    session_id,
+                    watch::Receiver::constant(acp::PromptCapabilities::new()),
+                    cx,
+                )
+            });
+            let history_thread_weak = history_thread.downgrade();
+            for (index, update) in page.updates.into_iter().enumerate() {
+                apply_session_update_to_thread(&history_thread_weak, update, cx)?;
+                if index % 16 == 15 {
+                    // Give painting and input a chance between chunks of a page.
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(1))
+                        .await;
+                }
+            }
+            let entries = history_thread.update(cx, |thread, cx| thread.take_history_entries(cx));
+            Ok(SessionHistoryPage {
+                entries,
+                next_cursor: page.next_cursor,
+            })
+        })
+    }
+
     fn supports_resume_session(&self) -> bool {
         self.agent_capabilities
             .session_capabilities
@@ -1843,6 +1924,13 @@ impl AgentConnection for AcpConnection {
                         .await
                         .map_err(map_acp_error)?;
                     Ok(SessionConfigResponse {
+                        history_cursor: response
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.get(HISTORY_PAGINATION_META_KEY))
+                            .and_then(|value| value.get("nextCursor"))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned),
                         modes: response.modes,
                         config_options: response.config_options,
                     })
@@ -1888,6 +1976,7 @@ impl AgentConnection for AcpConnection {
                         .await
                         .map_err(map_acp_error)?;
                     Ok(SessionConfigResponse {
+                        history_cursor: None,
                         modes: response.modes,
                         config_options: response.config_options,
                     })
@@ -4890,8 +4979,16 @@ fn handle_session_notification(
         session_list.send_info_update(notification.session_id.clone(), info_update.clone());
     }
 
+    apply_session_update_to_thread(&thread, notification.update, cx).log_err();
+}
+
+fn apply_session_update_to_thread(
+    thread: &WeakEntity<AcpThread>,
+    update: acp::SessionUpdate,
+    cx: &mut AsyncApp,
+) -> Result<(), acp::Error> {
     // Pre-handle: if a ToolCall carries terminal_info, create/register a display-only terminal.
-    if let acp::SessionUpdate::ToolCall(tc) = &notification.update {
+    if let acp::SessionUpdate::ToolCall(tc) = &update {
         if let Some(meta) = &tc.meta {
             if let Some(terminal_info) = meta.get("terminal_info") {
                 if let Some(id_str) = terminal_info.get("terminal_id").and_then(|v| v.as_str()) {
@@ -4922,27 +5019,20 @@ fn handle_session_notification(
                                 cx,
                             );
                         })
-                        .log_err();
+                        .map_err(acp::Error::from)?;
                 }
             }
         }
     }
 
-    // Forward the update to the acp_thread as usual.
-    if let Err(err) = thread
+    thread
         .update(cx, |thread, cx| {
-            thread.handle_session_update(notification.update.clone(), cx)
+            thread.handle_session_update(update.clone(), cx)
         })
-        .flatten_acp()
-    {
-        log::error!(
-            "Failed to handle session update for {:?}: {err:?}",
-            notification.session_id
-        );
-    }
+        .flatten_acp()?;
 
     // Post-handle: stream terminal output/exit if present on ToolCallUpdate meta.
-    if let acp::SessionUpdate::ToolCallUpdate(tcu) = &notification.update {
+    if let acp::SessionUpdate::ToolCallUpdate(tcu) = &update {
         if let Some(meta) = &tcu.meta {
             if let Some(term_out) = meta.get("terminal_output") {
                 if let Some(id_str) = term_out.get("terminal_id").and_then(|v| v.as_str()) {
@@ -4956,7 +5046,7 @@ fn handle_session_notification(
                                     cx,
                                 );
                             })
-                            .log_err();
+                            .map_err(acp::Error::from)?;
                     }
                 }
             }
@@ -4987,11 +5077,12 @@ fn handle_session_notification(
                                 cx,
                             );
                         })
-                        .log_err();
+                        .map_err(acp::Error::from)?;
                 }
             }
         }
     }
+    Ok(())
 }
 
 fn handle_create_terminal(

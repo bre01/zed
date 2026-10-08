@@ -837,8 +837,11 @@ impl SshRemoteConnection {
         version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
+        let download_release_channel = super::remote_server_download_channel(release_channel);
         let version_str = match release_channel {
-            ReleaseChannel::Dev => "build".to_string(),
+            ReleaseChannel::Dev if download_release_channel == ReleaseChannel::Dev => {
+                "build".to_string()
+            }
             _ => version.to_string(),
         };
         let binary_name = format!(
@@ -893,7 +896,7 @@ impl SshRemoteConnection {
             return Ok(dst_path.into());
         }
 
-        let wanted_version = cx.update(|cx| match release_channel {
+        let wanted_version = cx.update(|cx| match download_release_channel {
             ReleaseChannel::Nightly => Ok(None),
             ReleaseChannel::Dev => {
                 anyhow::bail!(
@@ -921,7 +924,7 @@ impl SshRemoteConnection {
             && let Some(url) = delegate
                 .get_download_url(
                     self.ssh_platform,
-                    release_channel,
+                    download_release_channel,
                     wanted_version.clone(),
                     cx,
                 )
@@ -948,7 +951,7 @@ impl SshRemoteConnection {
         let src_path = delegate
             .download_server_binary_locally(
                 self.ssh_platform,
-                release_channel,
+                download_release_channel,
                 wanted_version.clone(),
                 cx,
             )

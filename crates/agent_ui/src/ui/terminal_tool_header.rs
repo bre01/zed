@@ -19,6 +19,8 @@ pub struct TerminalToolHeader {
     id: SharedString,
     hover_group: SharedString,
     working_dir: SharedString,
+    command_summary: Option<SharedString>,
+    status_label: Option<&'static str>,
     is_expanded: bool,
     elapsed: Option<Duration>,
     running: bool,
@@ -42,6 +44,8 @@ impl TerminalToolHeader {
             id: id.into(),
             hover_group: hover_group.into(),
             working_dir: working_dir.into(),
+            command_summary: None,
+            status_label: None,
             is_expanded,
             elapsed: None,
             running: false,
@@ -101,6 +105,16 @@ impl TerminalToolHeader {
         self.command_slot = Some(element.into_any_element());
         self
     }
+
+    pub fn command_summary(mut self, summary: impl Into<SharedString>) -> Self {
+        self.command_summary = Some(summary.into());
+        self
+    }
+
+    pub fn status_label(mut self, label: &'static str) -> Self {
+        self.status_label = Some(label);
+        self
+    }
 }
 
 impl RenderOnce for TerminalToolHeader {
@@ -113,6 +127,8 @@ impl RenderOnce for TerminalToolHeader {
             id,
             hover_group,
             working_dir,
+            command_summary,
+            status_label,
             is_expanded,
             elapsed,
             running,
@@ -135,7 +151,7 @@ impl RenderOnce for TerminalToolHeader {
 
         let header_row = h_flex()
             .id(child_id("header"))
-            .pt_1()
+            .py_1()
             .pl_1p5()
             .pr_1()
             .flex_none()
@@ -143,21 +159,47 @@ impl RenderOnce for TerminalToolHeader {
             .justify_between()
             .rounded_t_md()
             .child(
-                div().w_full().min_w_0().overflow_hidden().child(
-                    Label::new(working_dir)
-                        .buffer_font(cx)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .truncate_start(),
-                ),
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1p5()
+                    .overflow_hidden()
+                    .when(command_summary.is_some(), |this| {
+                        this.child(
+                            Label::new(status_label.unwrap_or(if failed {
+                                "Failed"
+                            } else if running {
+                                "Running"
+                            } else {
+                                "Ran"
+                            }))
+                            .buffer_font(cx)
+                            .size(LabelSize::XSmall)
+                            .color(if failed {
+                                Color::Error
+                            } else {
+                                Color::Muted
+                            }),
+                        )
+                    })
+                    .child(
+                        div().min_w_0().overflow_hidden().child(
+                            Label::new(command_summary.unwrap_or_else(|| working_dir.clone()))
+                                .buffer_font(cx)
+                                .size(LabelSize::XSmall)
+                                .truncate(),
+                        ),
+                    ),
             )
-            .child(
-                Disclosure::new(child_id("disclosure"), is_expanded)
-                    .opened_icon(IconName::ChevronUp)
-                    .closed_icon(IconName::ChevronDown)
-                    .visible_on_hover(&hover_group)
-                    .when_some(on_toggle_expand, |this, handler| this.on_click(handler)),
-            )
+            .tooltip(Tooltip::text(working_dir))
+            .when_some(on_toggle_expand, |header, handler| {
+                header.child(
+                    Disclosure::new(child_id("disclosure"), is_expanded)
+                        .opened_icon(IconName::ChevronUp)
+                        .closed_icon(IconName::ChevronDown)
+                        .on_click(handler),
+                )
+            })
             .when(show_elapsed, |header| {
                 let elapsed = elapsed.unwrap_or_default();
                 header.child(
@@ -178,8 +220,10 @@ impl RenderOnce for TerminalToolHeader {
                             .color(Color::Muted)
                             .with_rotate_animation(2),
                     )
-                    .child(Divider::vertical().color(DividerColor::Border).ml_1())
-                    .child(
+                    .when_some(on_stop, |header, handler| {
+                        header
+                        .child(Divider::vertical().color(DividerColor::Border).ml_1())
+                        .child(
                         IconButton::new(child_id("stop"), IconName::Stop)
                             .icon_size(IconSize::Small)
                             .icon_color(Color::Error)
@@ -192,8 +236,9 @@ impl RenderOnce for TerminalToolHeader {
                                     cx,
                                 )
                             })
-                            .when_some(on_stop, |this, handler| this.on_click(handler)),
+                            .on_click(handler),
                     )
+                    })
             })
             .when_some(truncated_tooltip, |header, tooltip| {
                 header.child(
@@ -243,7 +288,7 @@ impl RenderOnce for TerminalToolHeader {
             .text_xs()
             .bg(header_bg)
             .child(header_row)
-            .children(command_slot)
+            .when(is_expanded, |this| this.children(command_slot))
     }
 }
 
@@ -271,13 +316,15 @@ impl Component for TerminalToolHeader {
                 .rounded_md()
                 .overflow_hidden()
                 .child(
-                    header.command_slot(
-                        div().px_1p5().pb_1().child(
-                            Label::new("cargo build --release")
-                                .buffer_font(cx)
-                                .size(LabelSize::XSmall),
+                    header
+                        .command_summary("cargo build --release")
+                        .command_slot(
+                            div().px_1p5().pb_1().child(
+                                Label::new("cargo build --release")
+                                    .buffer_font(cx)
+                                    .size(LabelSize::XSmall),
+                            ),
                         ),
-                    ),
                 )
                 .into_any_element()
         };

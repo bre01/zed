@@ -1,0 +1,2 @@
+# Empty context lines in a unified patch intentionally contain a single space.
+shared-server.patch whitespace=-blank-at-eol

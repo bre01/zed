@@ -326,6 +326,8 @@ impl Conversation {
                     | AcpThreadEvent::TokenUsageUpdated
                     | AcpThreadEvent::EntryUpdated(_)
                     | AcpThreadEvent::EntriesRemoved(_)
+                    | AcpThreadEvent::HistoryPrepended(_)
+                    | AcpThreadEvent::HistoryLoadChanged
                     | AcpThreadEvent::Retry(_)
                     | AcpThreadEvent::SubagentSpawned(_)
                     | AcpThreadEvent::Stopped(_)
@@ -584,6 +586,8 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         AcpThreadEvent::EntryUpdated(_)
         | AcpThreadEvent::StatusChanged
         | AcpThreadEvent::EntriesRemoved(_)
+        | AcpThreadEvent::HistoryPrepended(_)
+        | AcpThreadEvent::HistoryLoadChanged
         | AcpThreadEvent::Retry(_)
         | AcpThreadEvent::TokenUsageUpdated
         | AcpThreadEvent::PromptCapabilitiesUpdated
@@ -1637,6 +1641,40 @@ impl ConversationView {
                         active.sync_elicitation_state_for_entry(index, window, cx);
                         active.sync_editor_mode(cx);
                         active.sync_generating_indicator(cx);
+                    });
+                }
+            }
+            AcpThreadEvent::HistoryPrepended(count) => {
+                if let Some(active) = self.thread_view(&session_id) {
+                    let entry_view_state = active.read(cx).entry_view_state.clone();
+                    let list_state = active.read(cx).list_state.clone();
+                    entry_view_state.update(cx, |view_state, cx| {
+                        view_state.prepend(*count, thread, window, cx);
+                        // ListState shifts its item anchor while retaining its pixel
+                        // offset, so inserting history does not move the reader.
+                        list_state.splice_focusable(
+                            0..0,
+                            (0..*count).map(|index| {
+                                view_state
+                                    .entry(index)
+                                    .and_then(|entry| entry.focus_handle(cx))
+                            }),
+                        );
+                    });
+                    active.update(cx, |active, cx| {
+                        active.editing_message = active.editing_message.map(|index| index + count);
+                        active.hovered_edited_file_buttons = active
+                            .hovered_edited_file_buttons
+                            .map(|index| index + count);
+                        active.sync_generating_indicator(cx);
+                        cx.notify();
+                    });
+                }
+            }
+            AcpThreadEvent::HistoryLoadChanged => {
+                if let Some(active) = self.thread_view(&session_id) {
+                    active.update(cx, |_active, cx| {
+                        cx.notify();
                     });
                 }
             }
@@ -7284,6 +7322,116 @@ pub(crate) mod tests {
             1,
             "expanded thinking content should be searchable",
         );
+    }
+
+    #[gpui::test]
+    async fn test_compact_command_details_toggle(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        cx.simulate_resize(size(px(900.), px(700.)));
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let _workspace = conversation_view.read_with(cx, |view, _| view.workspace.upgrade());
+        cx.replace_root_view(|_, _| CompactCommandTestView(thread_view.clone()));
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        let tool_call_id = acp::ToolCallId::new("compact-command");
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id,
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(tool_call_id.clone(), "tmux send-keys -t board 'net iface' Enter\nsleep 4\ntmux capture-pane -p -t board")
+                        .kind(acp::ToolKind::Execute)
+                        .status(acp::ToolCallStatus::Completed)
+                        .content(vec!["one\ntwo\nthree\nfour\nfive\nsix".into()]),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        thread_view.update(cx, |view, cx| {
+            view.list_state.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("full-tool-command").is_none());
+        assert!(cx.debug_bounds("tool-call-output-0-0").is_none());
+        let details = cx
+            .debug_bounds("command-details")
+            .expect("collapsed command should offer disclosure");
+        assert!(
+            details.origin.y >= px(0.),
+            "disclosure must be inside the viewport: {details:?}"
+        );
+        cx.simulate_click(details.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            thread_view.read_with(cx, |view, cx| view
+                .entry_view_state
+                .read(cx)
+                .is_tool_call_expanded(&tool_call_id)),
+            "details click should expand the command"
+        );
+        assert!(cx.debug_bounds("full-tool-command").is_some());
+        assert!(cx.debug_bounds("tool-call-output-0-0").is_some());
+
+        thread_view.update(cx, |view, cx| {
+            view.entry_view_state
+                .update(cx, |state, _| state.collapse_tool_call(&tool_call_id));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("full-tool-command").is_none());
+        assert!(cx.debug_bounds("tool-call-output-0-0").is_none());
+        assert!(cx.debug_bounds("command-details").is_some());
+    }
+
+    struct CompactCommandTestView(Entity<ThreadView>);
+
+    impl Render for CompactCommandTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            v_flex().size_full().child(self.0.clone())
+        }
+    }
+
+    #[gpui::test]
+    async fn test_compact_command_approval_shows_full_script(cx: &mut TestAppContext) {
+        init_test(cx);
+        let tool_call_id = acp::ToolCallId::new("command-approval");
+        let connection =
+            StubAgentConnection::new().with_permission_requests(HashMap::from_iter([(
+                tool_call_id.clone(),
+                PermissionOptions::Flat(vec![acp::PermissionOption::new(
+                    "allow",
+                    "Allow",
+                    acp::PermissionOptionKind::AllowOnce,
+                )]),
+            )]));
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new(tool_call_id, "echo first\necho second\necho third")
+                .kind(acp::ToolKind::Execute),
+        )]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        cx.simulate_resize(size(px(900.), px(700.)));
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Run the command", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("full-tool-command").is_some(),
+            "approval must show the entire command without disclosure"
+        );
+        assert!(cx.debug_bounds("command-details").is_none());
     }
 
     #[gpui::test]

@@ -271,11 +271,16 @@ impl EntryViewState {
                         editor.set_message(chunks, window, cx);
                         editor
                     });
-                    cx.subscribe(&message_editor, move |_, editor, event, cx| {
-                        cx.emit(EntryViewEvent {
-                            entry_index: index,
-                            view_event: ViewEvent::MessageEditorEvent(editor, event.clone()),
-                        })
+                    cx.subscribe(&message_editor, move |this, editor, event, cx| {
+                        // Entry indices move when older history is prepended.
+                        if let Some(entry_index) = this.entries.iter().position(|entry| {
+                            matches!(entry, Entry::UserMessage(existing) if existing == &editor)
+                        }) {
+                            cx.emit(EntryViewEvent {
+                                entry_index,
+                                view_event: ViewEvent::MessageEditorEvent(editor, event.clone()),
+                            });
+                        }
                     })
                     .detach();
                     self.set_entry(index, Entry::UserMessage(message_editor));
@@ -338,13 +343,16 @@ impl EntryViewState {
                         let editor = create_editor_diff(diff.clone(), window, cx);
                         cx.subscribe(&editor, {
                             let diff = diff.clone();
-                            let entry_index = index;
-                            move |_this, _editor, event: &EditorEvent, cx| {
+                            move |this, editor, event: &EditorEvent, cx| {
                                 if let EditorEvent::OpenExcerptsRequested {
                                     selections_by_buffer,
                                     split,
                                 } = event
                                 {
+                                    let Some(entry_index) = this.entries.iter().position(|entry| {
+                                        matches!(entry, Entry::ToolCall(tool) if tool.content.values()
+                                            .any(|view| view.entity_id() == editor.entity_id()))
+                                    }) else { return; };
                                     let multibuffer = diff.read(cx).multibuffer();
                                     if let Some((buffer_id, (ranges, _))) =
                                         selections_by_buffer.iter().next()
@@ -458,6 +466,38 @@ impl EntryViewState {
                 .and_then(|(entry_ix, chunk_ix)| {
                     reindex_after_removal(entry_ix, &range).map(|entry_ix| (entry_ix, chunk_ix))
                 });
+    }
+
+    pub fn prepend(
+        &mut self,
+        count: usize,
+        thread: &Entity<AcpThread>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.expanded_compactions = self
+            .expanded_compactions
+            .iter()
+            .map(|ix| ix + count)
+            .collect();
+        self.expanded_thinking_blocks = self
+            .expanded_thinking_blocks
+            .iter()
+            .map(|&(ix, chunk)| (ix + count, chunk))
+            .collect();
+        self.user_toggled_thinking_blocks = self
+            .user_toggled_thinking_blocks
+            .iter()
+            .map(|&(ix, chunk)| (ix + count, chunk))
+            .collect();
+        self.auto_expanded_thinking_block = self
+            .auto_expanded_thinking_block
+            .map(|(ix, chunk)| (ix + count, chunk));
+        let previous_entries = std::mem::take(&mut self.entries);
+        for index in 0..count {
+            self.sync_entry(index, thread, window, cx);
+        }
+        self.entries.extend(previous_entries);
     }
 
     pub fn agent_ui_font_size_changed(&mut self, cx: &mut App) {
@@ -742,6 +782,115 @@ mod tests {
         assert_eq!(reindex_after_removal(5, &(2..4)), Some(3));
         // An empty removal range leaves indices untouched.
         assert_eq!(reindex_after_removal(3, &(2..2)), Some(3));
+    }
+
+    #[gpui::test]
+    async fn test_history_prepend_retains_scroll_and_editor_events(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|_, cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::default(), cx)
+            })
+            .await
+            .unwrap();
+        let older = cx
+            .update(|_, cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::default(), cx)
+            })
+            .await
+            .unwrap();
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, "Recent question".into(), cx);
+            thread.push_assistant_content_block("Recent thought".into(), true, cx);
+        });
+        let entries = older.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, "Earlier question".into(), cx);
+            thread.push_assistant_content_block("Earlier answer".into(), false, cx);
+            thread.take_history_entries(cx)
+        });
+        connection.set_next_history_page(acp_thread::SessionHistoryPage {
+            entries,
+            next_cursor: None,
+        });
+        let view_state = cx.new(|_| {
+            EntryViewState::new(
+                workspace.downgrade(),
+                project.downgrade(),
+                None,
+                Arc::new(RwLock::new(SessionCapabilities::default())),
+                "Test Agent".into(),
+            )
+        });
+        view_state.update_in(cx, |state, window, cx| {
+            state.sync_entry(0, &thread, window, cx);
+            state.sync_entry(1, &thread, window, cx);
+            state.user_toggled_thinking_blocks.insert((1, 0));
+            state.auto_expanded_thinking_block = Some((1, 0));
+        });
+        let editor = view_state.read_with(cx, |state, _| {
+            let super::Entry::UserMessage(editor) = state.entry(0).unwrap() else {
+                panic!("User editor expected");
+            };
+            editor.clone()
+        });
+        let list = gpui::ListState::new(2, gpui::ListAlignment::Top, gpui::px(0.));
+        list.scroll_to(gpui::ListOffset {
+            item_ix: 1,
+            offset_in_item: gpui::px(17.),
+        });
+        let _subscription = view_state.update_in(cx, |_, window, cx| {
+            let list = list.clone();
+            cx.subscribe_in(&thread, window, move |state, thread, event, window, cx| {
+                if let acp_thread::AcpThreadEvent::HistoryPrepended(count) = event {
+                    state.prepend(*count, thread, window, cx);
+                    list.splice_focusable(
+                        0..0,
+                        (0..*count).map(|index| {
+                            state.entry(index).and_then(|entry| entry.focus_handle(cx))
+                        }),
+                    );
+                }
+            })
+        });
+        let seen = cx.new(|cx| {
+            cx.subscribe(&view_state, |seen: &mut Vec<usize>, _, event, _| {
+                if matches!(event.view_event, super::ViewEvent::MessageEditorEvent(_, _)) {
+                    seen.push(event.entry_index);
+                }
+            })
+            .detach();
+            Vec::new()
+        });
+        thread.update(cx, |thread, cx| {
+            thread.set_history_cursor(Some("older".into()), cx);
+            thread.load_older_history(cx);
+        });
+        cx.run_until_parked();
+        let scroll = list.logical_scroll_top();
+        assert_eq!(scroll.item_ix, 3);
+        assert_eq!(scroll.offset_in_item, gpui::px(17.));
+        view_state.read_with(cx, |state, _| {
+            let super::Entry::UserMessage(retained) = state.entry(2).unwrap() else {
+                panic!("User editor expected");
+            };
+            assert_eq!(retained, &editor);
+            assert!(state.user_toggled_thinking_blocks.contains(&(3, 0)));
+            assert_eq!(state.auto_expanded_thinking_block, Some((3, 0)));
+        });
+        editor.update(cx, |_, cx| {
+            cx.emit(crate::message_editor::MessageEditorEvent::Focus)
+        });
+        cx.run_until_parked();
+        assert_eq!(seen.read_with(cx, |seen, _| seen.last().copied()), Some(2));
     }
 
     #[gpui::test]

@@ -258,7 +258,11 @@ fn main() {
         return;
     }
 
-    let restart_arguments = if let Some(directory) = args.user_data_dir.as_deref() {
+    let restart_arguments = if let Some(directory) = args
+        .user_data_dir
+        .as_deref()
+        .or(option_env!("ZED_TEST_DATA_DIR"))
+    {
         let directory = paths::set_custom_data_dir(directory);
         vec![
             std::ffi::OsString::from("--user-data-dir"),

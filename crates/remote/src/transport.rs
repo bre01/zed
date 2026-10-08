@@ -20,6 +20,19 @@ pub mod mock;
 pub mod ssh;
 pub mod wsl;
 
+fn remote_server_download_channel(
+    channel: release_channel::ReleaseChannel,
+) -> release_channel::ReleaseChannel {
+    // The installed test client changes only client-side behavior and uses the
+    // matching official server release, stored under its own remote filename.
+    if channel == release_channel::ReleaseChannel::Dev && option_env!("ZED_TEST_DATA_DIR").is_some()
+    {
+        release_channel::ReleaseChannel::Stable
+    } else {
+        channel
+    }
+}
+
 /// Parses the output of `uname -sm` to determine the remote platform.
 /// Takes the last line to skip possible shell initialization output.
 fn parse_platform(output: &str) -> Result<RemotePlatform> {
@@ -262,8 +275,15 @@ async fn build_remote_server_from_source(
 
     // By default, we make building remote server from source opt-out and we do not force artifact compression
     // for quicker builds.
-    let build_remote_server =
-        std::env::var("ZED_BUILD_REMOTE_SERVER").unwrap_or("nocompress".into());
+    let build_remote_server = std::env::var("ZED_BUILD_REMOTE_SERVER").unwrap_or_else(|_| {
+        // The installed test app uses its separately deployed remote helper.
+        // It does not have a checkout beside the application bundle.
+        if option_env!("ZED_TEST_DATA_DIR").is_some() {
+            "never".into()
+        } else {
+            "nocompress".into()
+        }
+    });
 
     if let "never" = &*build_remote_server {
         return Ok(None);

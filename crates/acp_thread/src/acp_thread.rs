@@ -2095,6 +2095,10 @@ pub struct AcpThread {
     title: Option<SharedString>,
     provisional_title: Option<SharedString>,
     entries: Vec<AgentThreadEntry>,
+    history_cursor: Option<String>,
+    history_loading: bool,
+    history_error: Option<SharedString>,
+    history_load_task: Option<Task<()>>,
     elicitations: ElicitationStore,
     plan: Plan,
     project: Entity<Project>,
@@ -2167,6 +2171,8 @@ pub enum AcpThreadEvent {
     StatusChanged,
     PromptUpdated,
     NewEntry,
+    HistoryPrepended(usize),
+    HistoryLoadChanged,
     TitleUpdated,
     TokenUsageUpdated,
     EntryUpdated(usize),
@@ -2307,6 +2313,8 @@ impl AcpThread {
                 | AcpThreadEvent::ElicitationResponded(_) => this.update_idle_sleep_prevention(cx),
                 AcpThreadEvent::PromptUpdated
                 | AcpThreadEvent::NewEntry
+                | AcpThreadEvent::HistoryPrepended(_)
+                | AcpThreadEvent::HistoryLoadChanged
                 | AcpThreadEvent::TitleUpdated
                 | AcpThreadEvent::TokenUsageUpdated
                 | AcpThreadEvent::EntryUpdated(_)
@@ -2346,6 +2354,10 @@ impl AcpThread {
             update_last_checkpoint_if_changed_task: None,
             shared_buffers: Default::default(),
             entries: Default::default(),
+            history_cursor: None,
+            history_loading: false,
+            history_error: None,
+            history_load_task: None,
             elicitations: ElicitationStore::default(),
             plan: Default::default(),
             title,
@@ -2436,6 +2448,134 @@ impl AcpThread {
 
     pub fn entries(&self) -> &[AgentThreadEntry] {
         &self.entries
+    }
+
+    pub fn set_history_cursor(&mut self, cursor: Option<String>, cx: &mut Context<Self>) {
+        self.history_cursor = cursor;
+        cx.emit(AcpThreadEvent::HistoryLoadChanged);
+    }
+
+    pub fn has_older_history(&self) -> bool {
+        self.history_cursor.is_some()
+    }
+
+    pub fn has_paginated_history(&self) -> bool {
+        self.history_cursor.is_some() || self.history_load_task.is_some()
+    }
+
+    pub fn is_loading_history(&self) -> bool {
+        self.history_loading
+    }
+
+    pub fn history_load_error(&self) -> Option<&SharedString> {
+        self.history_error.as_ref()
+    }
+
+    /// Used by the connection to construct one historical page in isolation,
+    /// so old tool updates cannot modify a live entry with the same id.
+    pub fn take_history_entries(&mut self, cx: &mut Context<Self>) -> Vec<AgentThreadEntry> {
+        Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
+        mem::take(&mut self.entries)
+    }
+
+    pub fn load_older_history(&mut self, cx: &mut Context<Self>) {
+        if self.history_loading {
+            return;
+        }
+        let Some(cursor) = self.history_cursor.clone() else {
+            return;
+        };
+        self.history_loading = true;
+        self.history_error = None;
+        cx.emit(AcpThreadEvent::HistoryLoadChanged);
+        let page =
+            self.connection
+                .clone()
+                .load_history_page(self.session_id.clone(), cursor.clone(), cx);
+        self.history_load_task = Some(cx.spawn(async move |this, cx| {
+            let result = page.await;
+            this.update(cx, |this, cx| {
+                this.history_loading = false;
+                match result {
+                    Ok(mut page) if this.history_cursor.as_ref() == Some(&cursor) => {
+                        if page.next_cursor.as_ref() == Some(&cursor) {
+                            this.history_error = Some("History did not advance. Try again.".into());
+                        } else {
+                            this.remove_history_overlap(&mut page.entries);
+                            let count = page.entries.len();
+                            this.entries.splice(0..0, page.entries);
+                            this.history_cursor = page.next_cursor;
+                            if count > 0 {
+                                cx.emit(AcpThreadEvent::HistoryPrepended(count));
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::warn!("Failed to load older thread history: {error:#}");
+                        this.history_error =
+                            Some("Could not load earlier messages. Try again.".into());
+                    }
+                }
+                cx.emit(AcpThreadEvent::HistoryLoadChanged);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn remove_history_overlap(&self, entries: &mut Vec<AgentThreadEntry>) {
+        // A long-running tool from before the replay boundary may complete while
+        // we fetch older pages. Keep the already displayed live entry and status.
+        let mut user_ids = HashSet::default();
+        let mut tool_ids = HashSet::default();
+        let mut message_ids = HashSet::default();
+        for entry in &self.entries {
+            match entry {
+                AgentThreadEntry::UserMessage(message) => {
+                    if let Some(id) = &message.protocol_id {
+                        user_ids.insert(id.clone());
+                    }
+                }
+                AgentThreadEntry::ToolCall(tool) => {
+                    tool_ids.insert(tool.id.clone());
+                }
+                AgentThreadEntry::AssistantMessage(message) => {
+                    for chunk in &message.chunks {
+                        match chunk {
+                            AssistantMessageChunk::Message { id: Some(id), .. } => {
+                                message_ids.insert((false, id.clone()));
+                            }
+                            AssistantMessageChunk::Thought { id: Some(id), .. } => {
+                                message_ids.insert((true, id.clone()));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        entries.retain_mut(|entry| match entry {
+            AgentThreadEntry::UserMessage(message) => message
+                .protocol_id
+                .as_ref()
+                .is_none_or(|id| !user_ids.contains(id)),
+            AgentThreadEntry::ToolCall(tool) => !tool_ids.contains(&tool.id),
+            AgentThreadEntry::AssistantMessage(message) => {
+                message.chunks.retain(|chunk| match chunk {
+                    AssistantMessageChunk::Message { id: Some(id), .. } => {
+                        !message_ids.contains(&(false, id.clone()))
+                    }
+                    AssistantMessageChunk::Thought { id: Some(id), .. } => {
+                        !message_ids.contains(&(true, id.clone()))
+                    }
+                    _ => true,
+                });
+                !message.chunks.is_empty()
+            }
+            _ => true,
+        });
     }
 
     pub fn is_compacting(&self) -> bool {
@@ -7526,6 +7666,121 @@ mod tests {
         .unwrap()
     }
 
+    #[gpui::test]
+    async fn test_history_page_preserves_live_messages_and_retries(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, PathList::default(), cx)
+            })
+            .await
+            .unwrap();
+        let older = new_test_thread(cx).await;
+        let old_entries = older.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, "Earlier question".into(), cx);
+            thread
+                .upsert_tool_call(
+                    acp::ToolCall::new("overlap-tool", "Old tool")
+                        .status(acp::ToolCallStatus::InProgress),
+                    cx,
+                )
+                .unwrap();
+            thread.push_assistant_content_block("Earlier answer".into(), false, cx);
+            thread.take_history_entries(cx)
+        });
+        connection
+            .history_response
+            .replace(Some(Task::ready(Ok(SessionHistoryPage {
+                entries: old_entries,
+                next_cursor: None,
+            }))));
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, "Recent question".into(), cx);
+            thread
+                .upsert_tool_call(
+                    acp::ToolCall::new("overlap-tool", "Live tool")
+                        .status(acp::ToolCallStatus::Completed),
+                    cx,
+                )
+                .unwrap();
+            thread.push_assistant_content_block("Recent answer".into(), false, cx);
+            thread.set_history_cursor(Some("older-page".into()), cx);
+            thread.load_older_history(cx);
+            thread.load_older_history(cx); // A second scroll must not request the same page again.
+            thread.push_user_content_block(None, "Live question".into(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(*connection.history_cursors.borrow(), ["older-page"]);
+        thread.read_with(cx, |thread, cx| {
+            let text = thread.to_markdown(cx);
+            let messages = [
+                "Earlier question",
+                "Earlier answer",
+                "Recent question",
+                "Recent answer",
+                "Live question",
+            ];
+            let positions: Vec<_> = messages
+                .iter()
+                .map(|message| {
+                    assert_eq!(text.matches(message).count(), 1);
+                    text.find(message).unwrap()
+                })
+                .collect();
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(!thread.has_older_history());
+            assert!(!thread.is_loading_history());
+            let tools: Vec<_> = thread
+                .entries()
+                .iter()
+                .filter_map(|entry| {
+                    if let AgentThreadEntry::ToolCall(tool) = entry {
+                        Some(tool)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].label.read(cx).source(), "Live tool");
+            assert!(matches!(tools[0].status, ToolCallStatus::Completed));
+        });
+        connection
+            .history_response
+            .replace(Some(Task::ready(Err(anyhow!("Temporary failure")))));
+        thread.update(cx, |thread, cx| {
+            thread.set_history_cursor(Some("retry-page".into()), cx);
+            thread.load_older_history(cx);
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.has_older_history());
+            assert!(thread.history_load_error().is_some());
+            assert_eq!(thread.entries().len(), 6);
+        });
+        connection
+            .history_response
+            .replace(Some(Task::ready(Ok(SessionHistoryPage {
+                entries: Vec::new(),
+                next_cursor: None,
+            }))));
+        thread.update(cx, |thread, cx| thread.load_older_history(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            *connection.history_cursors.borrow(),
+            ["older-page", "retry-page", "retry-page"]
+        );
+        thread.read_with(cx, |thread, _| {
+            assert!(!thread.has_older_history());
+            assert!(thread.history_load_error().is_none());
+            assert_eq!(thread.entries().len(), 6);
+        });
+    }
+
     fn only_thread_elicitation(thread: &AcpThread) -> (ElicitationEntryId, &Elicitation) {
         let [entry] = thread.entries() else {
             panic!("expected one elicitation entry, got {:?}", thread.entries());
@@ -8850,6 +9105,8 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct FakeAgentConnection {
+        history_response: Rc<RefCell<Option<Task<Result<SessionHistoryPage>>>>>,
+        history_cursors: Rc<RefCell<Vec<String>>>,
         auth_methods: Vec<acp::AuthMethod>,
         supports_truncate: bool,
         sessions: Arc<parking_lot::Mutex<HashMap<acp::SessionId, WeakEntity<AcpThread>>>>,
@@ -8869,6 +9126,8 @@ mod tests {
     impl FakeAgentConnection {
         fn new() -> Self {
             Self {
+                history_response: Rc::new(RefCell::new(None)),
+                history_cursors: Rc::new(RefCell::new(Vec::new())),
                 auth_methods: Vec::new(),
                 supports_truncate: true,
                 on_user_message: None,
@@ -8903,6 +9162,19 @@ mod tests {
     }
 
     impl AgentConnection for FakeAgentConnection {
+        fn load_history_page(
+            self: Rc<Self>,
+            _session_id: acp::SessionId,
+            cursor: String,
+            _cx: &mut App,
+        ) -> Task<Result<SessionHistoryPage>> {
+            self.history_cursors.borrow_mut().push(cursor);
+            self.history_response
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| Task::ready(Err(anyhow!("No history response"))))
+        }
+
         fn agent_id(&self) -> AgentId {
             AgentId::new("fake")
         }

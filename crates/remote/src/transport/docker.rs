@@ -214,13 +214,16 @@ impl DockerExecConnection {
         let remote_platform = self
             .remote_platform
             .context("No remote platform defined; cannot proceed.")?;
+        let download_release_channel = super::remote_server_download_channel(release_channel);
 
         let version_str = match release_channel {
             ReleaseChannel::Nightly => {
                 let commit = commit.map(|s| s.full()).unwrap_or_default();
                 format!("{}-{}", version, commit)
             }
-            ReleaseChannel::Dev => "build".to_string(),
+            ReleaseChannel::Dev if download_release_channel == ReleaseChannel::Dev => {
+                "build".to_string()
+            }
             _ => version.to_string(),
         };
         let binary_name = format!(
@@ -274,7 +277,7 @@ impl DockerExecConnection {
             return Ok(dst_path.into());
         }
 
-        let wanted_version = cx.update(|cx| match release_channel {
+        let wanted_version = cx.update(|cx| match download_release_channel {
             ReleaseChannel::Nightly => Ok(None),
             ReleaseChannel::Dev => {
                 anyhow::bail!(
@@ -295,7 +298,12 @@ impl DockerExecConnection {
         );
         if !self.connection_options.upload_binary_over_docker_exec
             && let Some(url) = delegate
-                .get_download_url(remote_platform, release_channel, wanted_version.clone(), cx)
+                .get_download_url(
+                    remote_platform,
+                    download_release_channel,
+                    wanted_version.clone(),
+                    cx,
+                )
                 .await?
         {
             match self
@@ -323,7 +331,12 @@ impl DockerExecConnection {
         }
 
         let src_path = delegate
-            .download_server_binary_locally(remote_platform, release_channel, wanted_version, cx)
+            .download_server_binary_locally(
+                remote_platform,
+                download_release_channel,
+                wanted_version,
+                cx,
+            )
             .await
             .context("downloading server binary locally")?;
         self.upload_local_server_binary(

@@ -1068,6 +1068,13 @@ impl ThreadView {
                 cx.defer(move |cx| {
                     let scroll_top = list_state.logical_scroll_top();
                     let _ = thread_view.update(cx, |this, cx| {
+                        if scroll_top.item_ix <= 3 && !this.list_state.is_following_tail() {
+                            this.thread.update(cx, |thread, cx| {
+                                if thread.history_load_error().is_none() {
+                                    thread.load_older_history(cx);
+                                }
+                            });
+                        }
                         if let Some(thread) = this.as_native_thread(cx) {
                             thread.update(cx, |thread, _cx| {
                                 thread.set_ui_scroll_position(Some(scroll_top));
@@ -6082,6 +6089,29 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 }
 
 impl ThreadView {
+    fn render_history_notice(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let thread = self.thread.read(cx);
+        let label = if !thread.has_older_history() {
+            "Beginning of conversation"
+        } else if thread.is_loading_history() {
+            "Loading earlier messages…"
+        } else if thread.history_load_error().is_some() {
+            "Could not load earlier messages. Click to retry."
+        } else {
+            "Earlier messages omitted · scroll up or click to load"
+        };
+        h_flex().w_full().justify_center().py_2().child(
+            Button::new("load-earlier-history", label)
+                .style(ButtonStyle::Subtle)
+                .size(ButtonSize::Compact)
+                .disabled(thread.is_loading_history() || !thread.has_older_history())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.thread
+                        .update(cx, |thread, cx| thread.load_older_history(cx));
+                })),
+        )
+    }
+
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
@@ -7770,22 +7800,16 @@ impl ThreadView {
         has_running_terminal_call
     }
 
-    fn render_collapsible_command(
+    fn render_full_command(
         &self,
         group: SharedString,
-        is_preview: bool,
         command: Entity<Markdown>,
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
         // The label's markdown source is a fenced code block (```\n...\n```);
         // strip the fences so the copy button yields just the command text.
-        let command_source = command.read(cx).source();
-        let command_text = command_source
-            .strip_prefix("```\n")
-            .and_then(|s| s.strip_suffix("\n```"))
-            .unwrap_or(&command_source)
-            .to_string();
+        let command_text = unfenced_tool_text(command.read(cx).source()).to_string();
 
         let mut style =
             MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_agent_buffer_font(cx);
@@ -7800,18 +7824,6 @@ impl ThreadView {
         style.code_block_overflow_x_scroll = false;
 
         let header_bg = self.tool_card_header_bg(cx);
-        let run_command_label = if is_preview {
-            Some(
-                h_flex().h_6().child(
-                    Label::new("Run Command")
-                        .buffer_font(cx)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-            )
-        } else {
-            None
-        };
         // Suppress the code block's built-in copy button so we don't stack two
         // copy buttons on top of each other; the outer button below is the one
         // we want, because it copies the unfenced command text.
@@ -7832,9 +7844,60 @@ impl ThreadView {
             .relative()
             .p_1p5()
             .bg(header_bg)
-            .when(is_preview, |this| this.pt_1().children(run_command_label))
-            .child(markdown_element)
+            .child(
+                div()
+                    .id("full-command")
+                    .debug_selector(|| "full-tool-command".to_string())
+                    .child(markdown_element),
+            )
             .child(div().absolute().top_1().right_1().child(copy_button))
+    }
+
+    fn render_command_preview(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        preview: CommandOutputPreview,
+        cx: &Context<Self>,
+    ) -> Div {
+        let disclosure_label = if preview.hidden_line_count > 0 {
+            format!("+ {} lines · Show details", preview.hidden_line_count)
+        } else {
+            "Show details".to_string()
+        };
+
+        v_flex()
+            .px_1p5()
+            .pb_1()
+            .min_w_0()
+            .children(preview.lines.into_iter().map(|line| {
+                Label::new(line)
+                    .buffer_font(cx)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .truncate()
+            }))
+            .child(
+                div()
+                    .id(("command-details-container", entry_ix))
+                    .debug_selector(|| "command-details".to_string())
+                    .self_start()
+                    .child(
+                        Button::new(("command-details", entry_ix), disclosure_label)
+                            .label_size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .on_click(cx.listener({
+                                let id = tool_call.id.clone();
+                                move |this, _, window, cx| {
+                                    this.entry_view_state.update(cx, |state, _| {
+                                        state.expand_tool_call(id.clone());
+                                    });
+                                    this.refresh_thread_search(window, cx);
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            )
     }
 
     fn render_terminal_tool_call(
@@ -7893,18 +7956,11 @@ impl ThreadView {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "current directory".to_string());
 
-        let command_element = self.render_collapsible_command(
-            header_group.clone(),
-            false,
-            tool_call.label.clone(),
-            window,
-            cx,
-        );
-
-        let is_expanded = self
-            .entry_view_state
-            .read(cx)
-            .is_tool_call_expanded(&tool_call.id);
+        let is_expanded = needs_confirmation
+            || self
+                .entry_view_state
+                .read(cx)
+                .is_tool_call_expanded(&tool_call.id);
 
         let truncated_tooltip = truncated_output.then(|| {
             if let Some(output) = output {
@@ -7929,22 +7985,35 @@ impl ThreadView {
 
         let header = TerminalToolHeader::new(
             terminal.entity_id().to_string(),
-            header_group,
+            header_group.clone(),
             working_dir,
             is_expanded,
         )
         .elapsed(time_elapsed)
-        .running(!command_finished && !needs_confirmation)
-        .on_toggle_expand(cx.listener({
-            let id = tool_call.id.clone();
-            move |this, _event, window, cx| {
-                this.entry_view_state.update(cx, |state, _cx| {
-                    state.toggle_tool_call_expansion(&id);
-                });
-                this.refresh_thread_search(window, cx);
-                cx.notify();
-            }
-        }))
+        .command_summary(compact_command_summary(tool_call.label.read(cx).source()))
+        .status_label(if command_failed {
+            "Failed"
+        } else {
+            command_status_label(&tool_call.status)
+        })
+        .running(
+            matches!(
+                tool_call.status,
+                ToolCallStatus::InProgress | ToolCallStatus::Pending
+            ) && !needs_confirmation,
+        )
+        .when(!needs_confirmation, |header| {
+            header.on_toggle_expand(cx.listener({
+                let id = tool_call.id.clone();
+                move |this, _event, window, cx| {
+                    this.entry_view_state.update(cx, |state, _cx| {
+                        state.toggle_tool_call_expansion(&id);
+                    });
+                    this.refresh_thread_search(window, cx);
+                    cx.notify();
+                }
+            }))
+        })
         .on_stop({
             let terminal = terminal.clone();
             cx.listener(move |this, _event, _window, cx| {
@@ -7969,7 +8038,30 @@ impl ThreadView {
         .when_some(tool_call.sandbox_not_applied.as_ref(), |header, reason| {
             header.sandbox_warning(self.sandbox_not_applied_warning(reason, cx))
         })
-        .command_slot(command_element);
+        .when(is_expanded, |header| {
+            header.command_slot(self.render_full_command(
+                header_group,
+                tool_call.label.clone(),
+                window,
+                cx,
+            ))
+        });
+
+        let preview = if is_expanded {
+            None
+        } else {
+            let terminal = terminal_data.inner().read(cx);
+            let lines = terminal.last_n_non_empty_lines(COMMAND_OUTPUT_PREVIEW_LINES);
+            let line_count =
+                output.map_or_else(|| terminal.used_lines(), |output| output.content_line_count);
+            Some(CommandOutputPreview {
+                hidden_line_count: line_count.saturating_sub(lines.len()),
+                lines: lines
+                    .iter()
+                    .map(|line| clipped_command_line(line).0)
+                    .collect(),
+            })
+        };
 
         let terminal_view = self
             .entry_view_state
@@ -7988,6 +8080,9 @@ impl ThreadView {
             })
             .overflow_hidden()
             .child(header)
+            .when_some(preview, |this, preview| {
+                this.child(self.render_command_preview(entry_ix, tool_call, preview, cx))
+            })
             .when(is_expanded && terminal_view.is_some(), |this| {
                 this.child(
                     div()
@@ -8227,7 +8322,7 @@ impl ThreadView {
         let has_content = !tool_call.content.is_empty()
             || (should_show_raw_input && tool_call.raw_input.is_some());
 
-        let is_collapsible = has_content && !needs_confirmation;
+        let is_collapsible = (has_content || is_terminal_tool) && !needs_confirmation;
         let mut is_open = self
             .entry_view_state
             .read(cx)
@@ -8475,13 +8570,43 @@ impl ThreadView {
         let body = v_flex()
             .map(|this| {
                 if is_terminal_tool {
-                    this.child(self.render_collapsible_command(
-                        card_header_id.clone(),
-                        true,
-                        tool_call.label.clone(),
-                        window,
-                        cx,
-                    ))
+                    this.child(
+                        TerminalToolHeader::new(
+                            tool_call.id.to_string(),
+                            card_header_id.clone(),
+                            "Run Command",
+                            is_open,
+                        )
+                        .command_summary(compact_command_summary(tool_call.label.read(cx).source()))
+                        .status_label(command_status_label(&tool_call.status))
+                        .running(matches!(tool_call.status, ToolCallStatus::InProgress | ToolCallStatus::Pending))
+                        .when(failed_or_canceled, |header| header.failed(None))
+                        .when(is_collapsible, |header| header.on_toggle_expand(cx.listener({
+                            let id = tool_call.id.clone();
+                            move |this, _, window, cx| {
+                                this.entry_view_state.update(cx, |state, _| {
+                                    state.toggle_tool_call_expansion(&id);
+                                });
+                                this.refresh_thread_search(window, cx);
+                                cx.notify();
+                            }
+                        })))
+                        .when(is_open, |header| header.command_slot(self.render_full_command(
+                            card_header_id.clone(),
+                            tool_call.label.clone(),
+                            window,
+                            cx,
+                        ))),
+                    )
+                    .when(!is_open, |this| {
+                        let preview = compact_command_output(tool_call.content.iter().filter_map(|content| {
+                            match content {
+                                ToolCallContent::ContentBlock(block) => block.text_content(cx),
+                                _ => None,
+                            }
+                        }));
+                        this.child(self.render_command_preview(entry_ix, tool_call, preview, cx))
+                    })
                 } else {
                     this.child(
                         h_flex()
@@ -12154,6 +12279,9 @@ impl Render for ThreadView {
         let list_state = self.list_state.clone();
 
         let conversation = v_flex()
+            .when(self.thread.read(cx).has_paginated_history(), |this| {
+                this.child(self.render_history_notice(cx))
+            })
             .when(self.resumed_without_history, |this| {
                 this.child(Self::render_resume_notice(cx))
             })
@@ -12647,6 +12775,80 @@ pub(crate) fn open_link(
     }
 }
 
+const COMMAND_OUTPUT_PREVIEW_LINES: usize = 3;
+const COMMAND_PREVIEW_LINE_CHARACTERS: usize = 256;
+
+struct CommandOutputPreview {
+    lines: Vec<String>,
+    hidden_line_count: usize,
+}
+
+fn unfenced_tool_text(source: &str) -> &str {
+    source
+        .strip_prefix("```\n")
+        .and_then(|text| text.strip_suffix("\n```"))
+        .unwrap_or(source)
+}
+
+fn clipped_command_line(line: &str) -> (String, bool) {
+    // Bound shaping work even when a tool prints a very large single line.
+    let mut characters = line.chars();
+    let mut preview: String = characters
+        .by_ref()
+        .take(COMMAND_PREVIEW_LINE_CHARACTERS)
+        .collect();
+    let clipped = characters.next().is_some();
+    if clipped {
+        preview.push_str(" …");
+    }
+    (preview, clipped)
+}
+
+fn compact_command_summary(source: &str) -> String {
+    let mut lines = unfenced_tool_text(source).lines();
+    let (mut summary, clipped) = clipped_command_line(lines.next().unwrap_or_default());
+    if !clipped && lines.next().is_some() {
+        summary.push_str(" …");
+    }
+    summary
+}
+
+fn compact_command_output<'a>(blocks: impl Iterator<Item = &'a str>) -> CommandOutputPreview {
+    let mut lines = Vec::new();
+    let mut line_count = 0;
+    for block in blocks {
+        let block = unfenced_tool_text(block);
+        line_count += block.lines().count();
+        let tail: Vec<_> = block
+            .lines()
+            .rev()
+            .take(COMMAND_OUTPUT_PREVIEW_LINES)
+            .collect();
+        lines.extend(tail.into_iter().rev());
+        let hidden_line_count = lines.len().saturating_sub(COMMAND_OUTPUT_PREVIEW_LINES);
+        lines.drain(..hidden_line_count);
+    }
+    CommandOutputPreview {
+        hidden_line_count: line_count.saturating_sub(lines.len()),
+        lines: lines
+            .into_iter()
+            .map(|line| clipped_command_line(line).0)
+            .collect(),
+    }
+}
+
+fn command_status_label(status: &ToolCallStatus) -> &'static str {
+    match status {
+        ToolCallStatus::Pending => "Queued",
+        ToolCallStatus::InProgress => "Running",
+        ToolCallStatus::Completed => "Ran",
+        ToolCallStatus::Failed => "Failed",
+        ToolCallStatus::Canceled => "Canceled",
+        ToolCallStatus::Rejected => "Rejected",
+        ToolCallStatus::WaitingForConfirmation { .. } => "Awaiting approval",
+    }
+}
+
 /// Returns the name of the leading built-in (native-category) slash command —
 /// e.g. `compact` for `/compact` or `/compact summarize the API work` — whether
 /// or not the user typed any trailing text after it. Built-in commands ignore
@@ -12691,6 +12893,51 @@ mod tests {
     use std::path::Path;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_compact_command_multiline_script() {
+        let command = "```\ntmux send-keys -t board 'net iface' Enter\nsleep 4\ntmux capture-pane -p -t board\n```";
+        assert_eq!(
+            compact_command_summary(command),
+            "tmux send-keys -t board 'net iface' Enter …"
+        );
+        assert_eq!(
+            unfenced_tool_text(command),
+            "tmux send-keys -t board 'net iface' Enter\nsleep 4\ntmux capture-pane -p -t board"
+        );
+        assert_eq!(compact_command_summary("cargo check"), "cargo check");
+        assert_eq!(compact_command_summary(""), "");
+    }
+
+    #[test]
+    fn test_compact_command_output_across_blocks() {
+        let preview =
+            compact_command_output(["one\ntwo\nthree\nfour\n", "five\nsix\n"].into_iter());
+        assert_eq!(preview.lines, ["four", "five", "six"]);
+        assert_eq!(preview.hidden_line_count, 3);
+
+        let preview = compact_command_output(["```\nfirst\n\nlast\n```", ""].into_iter());
+        assert_eq!(preview.lines, ["first", "", "last"]);
+        assert_eq!(preview.hidden_line_count, 0);
+
+        let preview = compact_command_output([""].into_iter());
+        assert!(preview.lines.is_empty());
+        assert_eq!(preview.hidden_line_count, 0);
+    }
+
+    #[test]
+    fn test_compact_command_long_unicode_lines() {
+        let command = "查".repeat(100_000);
+        let summary = compact_command_summary(&command);
+        assert_eq!(
+            summary,
+            format!("{} …", "查".repeat(COMMAND_PREVIEW_LINE_CHARACTERS))
+        );
+        let preview = compact_command_output([command.as_str()].into_iter());
+        assert_eq!(preview.lines, [summary]);
+        assert_eq!(preview.hidden_line_count, 0);
+        assert_eq!(command.chars().count(), 100_000);
+    }
 
     fn native_command(name: &str) -> acp::AvailableCommand {
         acp::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(

@@ -56,7 +56,7 @@ use ui::{
     prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
     render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
 };
-use util::{ResultExt, debug_panic};
+use util::ResultExt;
 use workspace::{
     ItemNavHistory, ModalView, Workspace,
     item::{Item, ItemEvent, TabTooltipContent},
@@ -2210,10 +2210,8 @@ impl GitGraph {
                     }
                 }))
             }
-            _ => {
-                debug_panic!(
-                    "Fetched commit data asynchronously, but was not given a listener or cached commit data."
-                );
+            CommitDataState::Loading(None) => {
+                log::warn!("Failed to queue commit message request for {sha}");
             }
         };
     }

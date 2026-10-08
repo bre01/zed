@@ -1,3 +1,37 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
+# Zed Test: shared Codex threads
+
+A personal Zed fork with shared Codex app-server sessions, native thread forking,
+compact command cards, and smoother long-thread browsing. Based on
+[Zed PR #63531](https://github.com/zed-industries/zed/pull/63531) at
+`6b990e1423b3e52cc35081e1b958f01a15ceb700`; the upstream PR supplies the core
+thread-forking UI and agent integration.
+
+- **One shared Codex daemon per machine:** attach through `codex app-server proxy`
+  so Zed, Codex CLI, and Desktop can view the same thread when they use the same
+  daemon/socket. Zed owns its adapter/proxy, while the daemon owns execution.
+- **Native forks:** `Fork Thread` creates a new Codex thread with inherited
+  history through app-server's native `thread/fork`. Open remote ACP threads can
+  fork on their remote host as well.
+- **Compact tool cards:** show a single-line command summary and the last three
+  output lines; expand details to read/copy the full command and output. Approval
+  cards continue to show the complete command.
+- **Long-thread browsing:** initially replay the last 100 native history items,
+  prepend older pages on upward scrolling or click, and preserve the viewport
+  and live messages. Model context is unchanged.
+- **UI performance and reliability:** queued focus-handle cleanup, optimized UI
+  crates, opt-in frame/input timing, Git-history reader recovery, isolated test
+  data, and matching official remote-server downloads for this test build.
+- **Closing Zed detaches:** the companion adapter patch preserves running daemon
+  turns, including Zed-started turns; explicit Stop still interrupts work.
+
+See [中文说明、构建方式和验证记录](ZED_TEST.md). The companion adapter patch and
+build scripts are included under `integration/codex-acp` and `script/zed-test`.
+
+---
+
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)

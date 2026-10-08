@@ -4018,14 +4018,12 @@ impl GitStore {
                         receivers.push(shared.clone());
                     }
                     CommitDataState::Loading(None) => {
-                        // todo(git_graph) this could happen if the request fails, we should encode an error case
-                        debug_panic!(
-                            "This should never happen since we passed true into fetch commit data"
-                        );
+                        anyhow::bail!("Failed to queue commit data request for {sha}");
                     }
                 }
             }
-        });
+            Ok(())
+        })?;
 
         let results = future::join_all(receivers).await;
 
@@ -7569,17 +7567,18 @@ impl Repository {
         } else {
             has_failed = true;
             handler.completion_senders.remove(&sha);
+            let removed = self.commit_data.remove(&sha);
             debug_assert!(
-                matches!(
-                    self.commit_data.remove(&sha),
-                    Some(CommitDataState::Loading(_))
-                ),
+                matches!(removed, Some(CommitDataState::Loading(_))),
                 "Commit data should still be loading when enqueueing the request fails"
             );
         }
 
         &self.commit_data.get(&sha).unwrap_or_else(|| {
-            debug_assert!(!has_failed, "This should always be inserted");
+            debug_assert!(
+                has_failed,
+                "Commit data should be cached unless enqueueing the request fails"
+            );
             &CommitDataState::Loading(None)
         })
     }
@@ -11936,6 +11935,78 @@ mod tests {
             path,
             PathBuf::from("/home/user/dev/worktrees/lsp-tests/nimble-sky/lsp-tests")
         );
+    }
+
+    #[gpui::test]
+    async fn test_commit_data_request_after_reader_closes(cx: &mut TestAppContext) {
+        init_test(cx);
+        let sha = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        let commit = CommitData {
+            sha,
+            parents: SmallVec::new(),
+            author_name: "Author".into(),
+            author_email: "author@example.com".into(),
+            commit_timestamp: 0,
+            subject: "Subject".into(),
+            message: "Subject\n\nBody".into(),
+        };
+
+        for await_result in [false, true] {
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                Path::new("/project"),
+                json!({ ".git": {}, "file.txt": "content" }),
+            )
+            .await;
+            fs.set_commit_data(Path::new("/project/.git"), vec![(commit.clone(), false)]);
+
+            let project = Project::test(fs, [Path::new("/project")], cx).await;
+            project
+                .update(cx, |project, cx| project.git_scans_complete(cx))
+                .await;
+            let repository =
+                project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
+
+            repository.update(cx, |repository, cx| {
+                // The background reader can close its channel before the foreground
+                // task has changed the handler state to Closed.
+                repository.get_handler(cx).commit_data_request.close();
+                assert!(matches!(
+                    repository.fetch_commit_data(sha, await_result, cx),
+                    CommitDataState::Loading(None)
+                ));
+                assert!(!repository.commit_data.contains_key(&sha));
+                verify_invariants(repository).unwrap();
+            });
+
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_secs(10));
+            cx.run_until_parked();
+
+            let receiver = repository.update(cx, |repository, cx| {
+                assert!(matches!(
+                    repository.commit_data_handler,
+                    CommitDataHandlerState::Closed
+                ));
+                verify_invariants(repository).unwrap();
+                let CommitDataState::Loading(Some(receiver)) =
+                    repository.fetch_commit_data(sha, true, cx)
+                else {
+                    panic!("retry should return a receiver");
+                };
+                receiver.clone()
+            });
+            let loaded = receiver.await.unwrap();
+            assert_eq!(loaded.sha, sha);
+            assert_eq!(loaded.message, commit.message);
+            repository.read_with(cx, |repository, _| {
+                verify_invariants(repository).unwrap();
+                assert!(matches!(
+                    repository.commit_data.get(&sha),
+                    Some(CommitDataState::Loaded(_))
+                ));
+            });
+        }
     }
 
     fn verify_invariants(repository: &Repository) -> anyhow::Result<()> {
